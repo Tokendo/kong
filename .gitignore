@@ -269,3 +269,4 @@ kong-config/
 *.key
 *.pem
 secrets.*
+/plan-*

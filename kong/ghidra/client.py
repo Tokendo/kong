@@ -81,6 +81,16 @@ class GhidraClient:
             raise GhidraClientError("Not open. Call open() first.")
         return self._flat_api
 
+    @property
+    def is_open(self) -> bool:
+        """True while the program database is available to read and write.
+
+        Anything that runs after the analysis — the finishing pass, the
+        coherence review — needs the program still open, and asking first is
+        how it reports that in one message rather than once per function.
+        """
+        return self._program is not None
+
     def open(self) -> GhidraClient:
         """Start PyGhidra JVM and open the binary for analysis."""
         if not Path(self.binary_path).exists():

@@ -125,6 +125,17 @@ class Supervisor:
         self._binary_identity: BinaryIdentity | None = None
         self._identity_resolved = False
 
+    def _program_is_open(self) -> bool:
+        """True while Ghidra still holds the program a pass would work on.
+
+        The passes that run after the analysis get their client from whoever
+        built the supervisor, and that owner is free to release it; asking
+        first is what turns a closed program into one message instead of one
+        failure per function. Duck-typed: a client without `is_open` — a test
+        double, mostly — is taken at its word.
+        """
+        return bool(getattr(self.client, "is_open", True))
+
     @property
     def _primary_model(self) -> str:
         """The model that has the final word on every function.
@@ -378,6 +389,17 @@ class Supervisor:
             self._coherence_lock.release()
 
     def _review_coherence(self, limit: int) -> CoherenceReport:
+        if not self._program_is_open():
+            self._emit(Event(
+                type=EventType.PHASE_COMPLETE,
+                phase=Phase.COHERENCE,
+                message=(
+                    "Coherence review needs the binary open in Ghidra, and it "
+                    "has been closed. Analyze it again to reopen the program."
+                ),
+            ))
+            return CoherenceReport()
+
         self._emit(Event(
             type=EventType.PHASE_START,
             phase=Phase.COHERENCE,
@@ -1518,6 +1540,21 @@ class Supervisor:
                     message=f"{label} needs a model to run, and this run has none.",
                     data={"refined": 0, "candidates": 0},
                 ))
+            return 0
+
+        if not self._program_is_open():
+            # Every call below decompiles, so without a program this is 61
+            # identical failures and a rewritten export built from none of
+            # them. Stop before the first one.
+            self._emit(Event(
+                type=EventType.PHASE_COMPLETE,
+                phase=Phase.ANALYSIS,
+                message=(
+                    f"{label} needs the binary open in Ghidra, and it has been "
+                    f"closed. Analyze it again to reopen the program."
+                ),
+                data={"refined": 0, "candidates": 0},
+            ))
             return 0
 
         candidates = self._refinement_candidates(manual=manual)

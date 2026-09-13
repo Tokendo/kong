@@ -1864,6 +1864,24 @@ class TestStagedRun:
         assert sup.run_finishing_pass() == 1
         assert sup.results[0x1000].name == "parse_http_header"
 
+    def test_a_closed_program_stops_the_finishing_pass_before_the_first_call(
+        self, tmp_path,
+    ):
+        """Whoever owns the client may have released it. Say so once."""
+        llm = self._llm(draft_confidence=40)
+        sup = self._run(tmp_path, [_func(0x1000, "FUN_1000", size=64)], llm)
+        assert sup.pending_finish == 1
+        sup.client.is_open = False
+        events = []
+        sup.on_event(events.append)
+
+        assert sup.run_finishing_pass() == 0
+
+        assert sup.results[0x1000].name == "draft_0"  # the draft is untouched
+        messages = [e.message for e in events]
+        assert any("open in Ghidra" in m for m in messages)
+        assert not any("Re-analyzing" in m for m in messages)
+
     def test_the_finishing_pass_re_exports(self, tmp_path):
         llm = self._llm(draft_confidence=40)
         sup = self._run(tmp_path, [_func(0x1000, "FUN_1000", size=64)], llm)

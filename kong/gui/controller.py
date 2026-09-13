@@ -34,6 +34,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Refusal shared by both manual passes. Ghidra is released when the window
+#: closes, so a controller kept alive past that has results to show but no
+#: program to re-read them from.
+_GHIDRA_RELEASED = (
+    "Ghidra has been released for this binary. Analyze it again to reopen the "
+    "program, then run this pass."
+)
+
 
 @dataclass
 class RunSettings:
@@ -225,6 +233,12 @@ class AnalysisController:
             raise ValueError("\n".join(problems))
         if self.state.running:
             raise RuntimeError("An analysis is already running.")
+        if self._manual_pass_running():
+            raise RuntimeError(
+                "A finishing pass or coherence review is still running. "
+                "Wait for it: starting another analysis would close the "
+                "program it is writing to."
+            )
 
         self.state = RunState(
             running=True,
@@ -240,6 +254,9 @@ class AnalysisController:
     def _worker(self) -> None:
         config = self.settings.to_config()
         try:
+            # A second run in the same window opens a second program; the one
+            # the previous run left behind is released here rather than leaked.
+            self._close_ghidra_client()
             client = self._ghidra_client_factory(
                 self.settings.binary_path, self.settings.ghidra_dir or None
             )
@@ -263,8 +280,22 @@ class AnalysisController:
             self._events.put(
                 Event(type=EventType.RUN_ERROR, message=f"{type(exc).__name__}: {exc}")
             )
-        finally:
-            self._close_ghidra_client()
+        # Ghidra is deliberately left open here. The finishing pass and the
+        # coherence review are started from the window *after* this thread has
+        # ended, and both read and write the same program database: closing it
+        # on the way out left them re-analyzing every function against a shut
+        # program, one "Not open. Call open() first." apiece. `shutdown` is
+        # what releases it, when the window closes.
+
+    def _ghidra_is_open(self) -> bool:
+        """True while there is a program for a manual pass to work on.
+
+        Duck-typed like the rest of the client: a factory that hands back
+        something without `is_open` is taken at its word.
+        """
+        with self._lock:
+            client = self._ghidra_client
+        return client is not None and bool(getattr(client, "is_open", True))
 
     def _close_ghidra_client(self) -> None:
         with self._lock:
@@ -300,6 +331,13 @@ class AnalysisController:
     def _get_supervisor(self) -> Any:
         with self._lock:
             return self._supervisor
+
+    def _manual_pass_running(self) -> bool:
+        """True while the finishing pass or the coherence review is working."""
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (self._coherence_thread, self._finish_thread)
+        )
 
     def poll(self) -> list[Event]:
         """Drain pending events, fold them into the state, and return them."""
@@ -421,6 +459,8 @@ class AnalysisController:
             return "The coherence pass is already running."
         if self._finish_thread is not None and self._finish_thread.is_alive():
             return "Wait for the finishing pass: it is still renaming functions."
+        if not self._ghidra_is_open():
+            return _GHIDRA_RELEASED
 
         self.state.checking_coherence = True
         self._coherence_thread = threading.Thread(
@@ -451,6 +491,8 @@ class AnalysisController:
             return "The finishing pass is already running."
         if self._coherence_thread is not None and self._coherence_thread.is_alive():
             return "Wait for the coherence pass: it is still renaming functions."
+        if not self._ghidra_is_open():
+            return _GHIDRA_RELEASED
         if supervisor.pending_finish == 0:
             return (
                 "Nothing to finish: no function failed or came back under the "

@@ -331,7 +331,8 @@ class TestAnalysisController:
         assert controller.state.finished
         assert not controller.state.running
 
-    def test_the_ghidra_client_is_closed_when_the_run_ends(self, tmp_path):
+    def test_ghidra_stays_open_for_the_passes_that_follow_the_run(self, tmp_path):
+        """The finishing pass and the coherence review come after the run."""
         ghidra_client = MagicMock()
         controller = _controller(
             _settings(tmp_path),
@@ -341,7 +342,52 @@ class TestAnalysisController:
 
         _run_to_completion(controller)
 
+        ghidra_client.close.assert_not_called()
+
+    def test_a_failed_run_leaves_ghidra_open_too(self, tmp_path):
+        """What failed is worth finishing by hand; the program has to be there."""
+        ghidra_client = MagicMock()
+        supervisor = _FakeSupervisor()
+        supervisor.run = MagicMock(side_effect=RuntimeError("boom"))
+        controller = _controller(
+            _settings(tmp_path), supervisor, ghidra_client=ghidra_client
+        )
+
+        _run_to_completion(controller)
+
+        ghidra_client.close.assert_not_called()
+
+    def test_a_second_run_releases_the_program_the_first_left_open(self, tmp_path):
+        ghidra_client = MagicMock()
+        controller = _controller(
+            _settings(tmp_path),
+            _FakeSupervisor([Event(type=EventType.RUN_COMPLETE, message="done")]),
+            ghidra_client=ghidra_client,
+        )
+
+        _run_to_completion(controller)
+        _run_to_completion(controller)
+
         ghidra_client.close.assert_called_once()
+
+    def test_a_new_run_will_not_start_under_a_manual_pass(self, tmp_path):
+        """Starting one would close the program the pass is writing to."""
+        supervisor = _FakeSupervisor(
+            [Event(type=EventType.RUN_COMPLETE, message="done")]
+        )
+        supervisor.pending_finish = 2
+        release = threading.Event()
+        supervisor.run_finishing_pass = lambda: release.wait(timeout=2)
+        controller = _controller(_settings(tmp_path), supervisor)
+        _run_to_completion(controller)
+        assert controller.request_finishing_pass() == ""
+
+        try:
+            with pytest.raises(RuntimeError, match="finishing pass"):
+                controller.start()
+        finally:
+            release.set()
+            controller._finish_thread.join(timeout=2)
 
     def test_cost_and_counters_come_from_the_live_objects(self, tmp_path):
         supervisor = _FakeSupervisor()
@@ -474,6 +520,18 @@ class TestCoherenceReview:
             finish.set()
             controller._coherence_thread.join(timeout=2)
 
+    def test_a_released_program_is_refused(self, tmp_path):
+        ghidra_client = MagicMock()
+        ghidra_client.is_open = False
+        supervisor = _FakeSupervisor()
+        controller = _controller(
+            _settings(tmp_path), supervisor, ghidra_client=ghidra_client
+        )
+        _run_to_completion(controller)
+
+        assert "released" in controller.request_coherence_review()
+        assert not supervisor.reviewed.is_set()
+
     def test_shutdown_pauses_and_releases_ghidra(self, tmp_path):
         ghidra_client = MagicMock()
         supervisor = _FakeSupervisor()
@@ -591,6 +649,20 @@ class TestFinishingPass:
         _run_to_completion(controller)
 
         assert controller.state.pending_finish == 7
+
+    def test_a_released_program_is_refused_rather_than_re_analyzed(self, tmp_path):
+        """Closing the window releases Ghidra; every call below would fail."""
+        ghidra_client = MagicMock()
+        ghidra_client.is_open = False
+        supervisor = _FakeSupervisor()
+        supervisor.pending_finish = 61
+        controller = _controller(
+            _settings(tmp_path), supervisor, ghidra_client=ghidra_client
+        )
+        _run_to_completion(controller)
+
+        assert "released" in controller.request_finishing_pass()
+        assert not supervisor.finished_pass.is_set()
 
     def test_the_two_manual_passes_do_not_overlap(self, tmp_path):
         supervisor = _FakeSupervisor()
