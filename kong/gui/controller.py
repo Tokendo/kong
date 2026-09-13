@@ -28,6 +28,7 @@ from kong.config import (
     OutputConfig,
     RunStage,
 )
+from kong.llm.activity import ActivitySnapshot, LLMActivity, TrackedLLMClient
 
 if TYPE_CHECKING:
     from kong.agent.models import AnalysisStats
@@ -166,6 +167,20 @@ class RunState:
     pending_finish: int = 0
     error: str = ""
     binary_label: str = ""
+    #: True while at least one request has been sent and not yet answered.
+    #: Minutes can pass there with nothing else to show, which is exactly the
+    #: stretch where a window that says nothing looks like a hung one.
+    llm_waiting: bool = False
+    #: Requests in flight, and what the oldest one is waiting for.
+    llm_in_flight: int = 0
+    llm_wait_label: str = ""
+    llm_wait_seconds: float = 0.0
+    #: Every answered request, and the time the run has spent waiting.
+    llm_answered: int = 0
+    llm_wait_total_seconds: float = 0.0
+    llm_last_wait_seconds: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     @property
     def progress_fraction(self) -> float:
@@ -205,6 +220,9 @@ class AnalysisController:
         self._ghidra_client_factory = ghidra_client_factory
         self._llm_client_factory = llm_client_factory
         self._supervisor_factory = supervisor_factory or self._build_supervisor
+        #: Shared with the wrapper around the LLM client, so every request
+        #: the run makes is timed whichever thread sends it.
+        self.activity = LLMActivity()
         self._thread: threading.Thread | None = None
         self._coherence_thread: threading.Thread | None = None
         self._finish_thread: threading.Thread | None = None
@@ -245,6 +263,9 @@ class AnalysisController:
             phase="opening binary",
             binary_label=Path(self.settings.binary_path).name,
         )
+        # A second run starts from zero calls waited on, like it starts from
+        # zero functions analyzed.
+        self.activity = LLMActivity()
         self._start_time = time.time()
         self._paused_total = 0.0
         self._pause_start = None
@@ -263,7 +284,9 @@ class AnalysisController:
             with self._lock:
                 self._ghidra_client = client
 
-            llm_client = self._llm_client_factory(config.llm)
+            llm_client = TrackedLLMClient(
+                self._llm_client_factory(config.llm), self.activity
+            )
             with self._lock:
                 self._llm_client = llm_client
 
@@ -388,6 +411,12 @@ class AnalysisController:
             llm_client = self._llm_client
         if llm_client is not None:
             state.cost_usd = getattr(llm_client, "total_cost_usd", 0.0)
+            usage = getattr(llm_client, "usage", None)
+            if usage is not None:
+                state.input_tokens = getattr(usage, "input_tokens", 0)
+                state.output_tokens = getattr(usage, "output_tokens", 0)
+
+        self._apply_activity(self.activity.snapshot())
 
         state.checking_coherence = (
             self._coherence_thread is not None and self._coherence_thread.is_alive()
@@ -404,6 +433,17 @@ class AnalysisController:
             state.elapsed_seconds = (
                 time.time() - self._start_time - self._paused_total - paused_now
             )
+
+    def _apply_activity(self, snapshot: ActivitySnapshot) -> None:
+        """Render what is in flight right now, and what it cost in waiting."""
+        state = self.state
+        state.llm_waiting = snapshot.waiting
+        state.llm_in_flight = snapshot.in_flight
+        state.llm_wait_label = snapshot.label
+        state.llm_wait_seconds = snapshot.waiting_seconds
+        state.llm_answered = snapshot.completed
+        state.llm_wait_total_seconds = snapshot.total_wait_seconds
+        state.llm_last_wait_seconds = snapshot.last_wait_seconds
 
     # ------------------------------------------------------------------ controls
 

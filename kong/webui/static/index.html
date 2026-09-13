@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kong — agentic reverse engineer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">KONG</span>
+    <span class="brand-sub">agentic reverse engineer</span>
+  </div>
+
+  <!-- The one thing a run cannot otherwise show: minutes spent inside a
+       single request, with nothing else moving. -->
+  <div id="llm-pill" class="pill pill--idle" title="State of the model request in flight">
+    <span class="pill-dot"></span>
+    <span class="pill-text" id="llm-pill-text">Model idle</span>
+  </div>
+
+  <button type="button" class="btn btn--quiet" id="quit">Quit</button>
+</header>
+
+<main class="layout">
+
+  <aside class="panel" id="form">
+    <section class="card">
+      <h2>Target</h2>
+
+      <label class="field" for="binary">Binary</label>
+      <div class="row">
+        <input type="text" id="binary" spellcheck="false" placeholder="/path/to/binary">
+        <button type="button" class="btn btn--ghost" data-browse="binary" data-mode="file">Browse</button>
+      </div>
+
+      <label class="field" for="output">Output directory</label>
+      <div class="row">
+        <input type="text" id="output" spellcheck="false">
+        <button type="button" class="btn btn--ghost" data-browse="output" data-mode="dir">Browse</button>
+      </div>
+
+      <span class="field">Formats</span>
+      <div class="chips" id="formats"></div>
+      <!-- The writeback is not a format because it is not optional: every
+           name and type lands in the program database as the run goes. -->
+      <p class="hint">Names and types go back into Ghidra as the run goes,
+        whatever is selected here.</p>
+      <p class="hint" id="format-hint"></p>
+
+      <label class="check">
+        <input type="checkbox" id="resume" checked>
+        <span>Resume where the last run over this binary stopped</span>
+      </label>
+    </section>
+
+    <section class="card">
+      <h2>Model</h2>
+
+      <div class="segmented" id="providers" role="radiogroup" aria-label="Provider"></div>
+
+      <label class="field" for="model">Model</label>
+      <input type="text" id="model" spellcheck="false">
+      <p class="hint" id="model-hint"></p>
+
+      <label class="field" for="base-url">Base URL</label>
+      <div class="row">
+        <input type="text" id="base-url" spellcheck="false">
+        <button type="button" class="btn btn--ghost" id="detect">Detect</button>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <label class="field" for="draft-model">Draft model</label>
+          <input type="text" id="draft-model" spellcheck="false" placeholder="(optional)">
+        </div>
+        <div>
+          <label class="field" for="refine-below">Refine below %</label>
+          <input type="number" id="refine-below" min="0" max="100">
+        </div>
+      </div>
+      <p class="hint">A draft model reads everything cheaply; the model above
+        re-reads only what came back under the threshold.</p>
+
+      <label class="check">
+        <input type="checkbox" id="draft-only">
+        <span>Draft only — stop after the first pass</span>
+      </label>
+
+      <label class="field" for="api-key">API key</label>
+      <div class="row">
+        <input type="password" id="api-key" spellcheck="false" autocomplete="off">
+        <button type="button" class="btn btn--ghost" id="save-key">Save</button>
+      </div>
+      <p class="hint" id="key-hint"></p>
+    </section>
+
+    <section class="card">
+      <h2>Token budget</h2>
+      <p class="hint">What one request to the model may spend. Leave a field
+        empty to use the figure the model table carries.</p>
+
+      <label class="field" for="max-output-tokens">Output tokens per request</label>
+      <input type="number" id="max-output-tokens" min="1" step="256" placeholder="model default">
+      <p class="hint">The ceiling on a single answer, batch calls included. Too
+        low and a model that reasons before it answers spends the whole budget
+        thinking and returns nothing — paid for in full.</p>
+
+      <div class="grid-2">
+        <div>
+          <label class="field" for="max-prompt-chars">Prompt chars</label>
+          <input type="number" id="max-prompt-chars" min="1" step="1000" placeholder="model default">
+        </div>
+        <div>
+          <label class="field" for="max-chunk-functions">Functions per batch</label>
+          <input type="number" id="max-chunk-functions" min="1" placeholder="model default">
+        </div>
+      </div>
+      <p class="hint">Fewer functions per batch means more requests, each with
+        more room to answer in.</p>
+    </section>
+  </aside>
+
+  <section class="panel panel--run">
+    <div class="toolbar">
+      <button type="button" class="btn" id="start">Analyze</button>
+      <button type="button" class="btn btn--ghost" id="pause" disabled>Pause</button>
+      <button type="button" class="btn btn--ghost" id="export" disabled>Export now</button>
+      <button type="button" class="btn btn--ghost" id="finish" disabled>Finish pass</button>
+      <button type="button" class="btn btn--ghost" id="coherence" disabled>Check coherence</button>
+    </div>
+
+    <div class="progress" role="progressbar" aria-label="Functions analyzed">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <p class="status" id="status">Idle.</p>
+
+    <div class="waiting" id="waiting" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <div>
+        <strong id="waiting-title">Waiting for the model</strong>
+        <span class="waiting-detail" id="waiting-detail"></span>
+      </div>
+      <span class="waiting-clock" id="waiting-clock">0s</span>
+    </div>
+
+    <div class="tiles" id="tiles"></div>
+
+    <div class="tabs" role="tablist">
+      <button type="button" class="tab tab--on" data-tab="log" role="tab">Log</button>
+      <button type="button" class="tab" data-tab="functions" role="tab">Functions <span class="count" id="count-functions">0</span></button>
+      <button type="button" class="tab" data-tab="coherence" role="tab">Coherence <span class="count" id="count-conflicts">0</span></button>
+    </div>
+
+    <div class="pane" id="pane-log"><pre id="log" class="log"></pre></div>
+
+    <div class="pane" id="pane-functions" hidden>
+      <input type="search" id="filter" class="filter" placeholder="Filter by name, address or class">
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr>
+            <th>Address</th><th>Original</th><th>Recovered</th><th>Conf.</th><th>Class</th>
+          </tr></thead>
+          <tbody id="functions"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="pane" id="pane-coherence" hidden>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr>
+            <th>Contradiction</th><th>Functions</th><th>What disagrees</th><th>Resolution</th>
+          </tr></thead>
+          <tbody id="conflicts"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="picker" class="picker">
+  <form method="dialog" class="picker-head">
+    <strong id="picker-title">Select a file</strong>
+    <button value="cancel" class="btn btn--quiet">Close</button>
+  </form>
+  <div class="picker-path" id="picker-path"></div>
+  <ul class="picker-list" id="picker-list"></ul>
+  <div class="picker-foot">
+    <button type="button" class="btn btn--ghost" id="picker-up">Parent directory</button>
+    <button type="button" class="btn" id="picker-pick" hidden>Use this directory</button>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

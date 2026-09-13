@@ -239,8 +239,18 @@ class TestOutputFormats:
         from kong.gui.app import OUTPUT_FORMATS
 
         assert [key for key, _ in OUTPUT_FORMATS] == [
-            "source", "json", "ghidra", "python", "csharp",
+            "source", "json", "python", "csharp",
         ]
+
+    def test_no_format_is_offered_that_the_export_ignores(self, window):
+        """'ghidra' was a checkbox for a file the export never wrote."""
+        from kong.gui.app import OUTPUT_FORMATS
+
+        assert "ghidra" not in {key for key, _ in OUTPUT_FORMATS}
+
+    def test_the_writeback_is_still_announced(self, window):
+        """Dropping the checkbox must not read as a lost feature."""
+        assert "back into Ghidra" in window.format_hint.cget("text")
 
     def test_selection_is_read_in_catalogue_order(self, window):
         window.format_vars["csharp"].set(True)
@@ -249,7 +259,7 @@ class TestOutputFormats:
         assert window.selected_formats() == ["json", "csharp"]
 
     def test_the_second_pass_is_flagged_when_reconstructing(self, window):
-        assert window.format_hint.cget("text") == ""
+        assert "second LLM pass" not in window.format_hint.cget("text")
 
         window.format_vars["python"].set(True)
         window._sync_format_hint()
@@ -262,7 +272,7 @@ class TestOutputFormats:
         window.format_vars["python"].set(False)
         window._sync_format_hint()
 
-        assert window.format_hint.cget("text") == ""
+        assert "second LLM pass" not in window.format_hint.cget("text")
 
     def test_formats_reach_the_settings(self, window, tmp_path):
         binary = tmp_path / "target.bin"
@@ -302,22 +312,47 @@ class TestLimitDefaults:
 
         expected = suggest_limits(32768)
         assert window.prompt_chars_var.get() == str(expected.max_prompt_chars)
-        assert window.output_tokens_var.get() == str(expected.max_output_tokens)
 
         self._select_custom(window)
+        assert window.output_tokens_var.get() == str(expected.max_output_tokens)
         assert window.chunk_functions_var.get() == str(expected.max_chunk_functions)
 
     def test_the_defaults_are_the_documented_numbers(self, window):
         assert window.prompt_chars_var.get() == "84216"
-        assert window.output_tokens_var.get() == "4096"
 
         self._select_custom(window)
+        assert window.output_tokens_var.get() == "4096"
         assert window.chunk_functions_var.get() == "15"
 
     def test_a_hosted_provider_opens_on_the_model_s_own_batch_size(self, window):
         """Blank, not the figure a 32k local server was sized for."""
         assert window.chunk_functions_var.get() == ""
         assert window.collect_settings().max_chunk_functions is None
+
+    def test_a_hosted_provider_opens_on_the_model_s_own_token_budget(self, window):
+        assert window.output_tokens_var.get() == ""
+        assert window.collect_settings().max_output_tokens is None
+
+    def test_a_token_budget_reaches_a_hosted_provider_too(self, window):
+        """The budget used to be dropped on everything but a local endpoint."""
+        window.output_tokens_var.set("8000")
+
+        settings = window.collect_settings()
+        assert settings.provider is LLMProvider.ANTHROPIC
+        assert settings.max_output_tokens == 8000
+        assert settings.to_config().llm.max_output_tokens == 8000
+
+    def test_each_provider_keeps_its_own_token_budget(self, window):
+        self._select_custom(window)
+        window.output_tokens_var.set("4096")
+
+        window.provider_var.set(LLMProvider.ANTHROPIC.value)
+        window._sync_provider_fields()
+        assert window.output_tokens_var.get() == ""
+
+        window.provider_var.set(LLMProvider.CUSTOM.value)
+        window._sync_provider_fields()
+        assert window.output_tokens_var.get() == "4096"
 
     def test_each_provider_keeps_its_own_batch_size(self, window):
         self._select_custom(window)

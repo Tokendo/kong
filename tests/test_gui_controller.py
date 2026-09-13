@@ -695,3 +695,81 @@ class TestStageSetting:
 
         assert config.llm.provider is LLMProvider.ANTHROPIC
         assert config.llm.max_chunk_functions == 30
+
+
+class TestLLMWaiting:
+    """What the interface shows while a request is out with the model."""
+
+    def test_the_state_says_which_call_it_is_waiting_on(self, tmp_path):
+        hold = threading.Event()
+        answered = threading.Event()
+
+        class _Client:
+            model = "claude-opus-5"
+            total_cost_usd = 0.0
+
+            def analyze_function_batch(self, prompt, *, model=None, max_tokens=None):
+                hold.wait(timeout=5)
+                answered.set()
+                return []
+
+        class _CallingSupervisor(_FakeSupervisor):
+            def __init__(self, llm):
+                super().__init__()
+                self.llm = llm
+
+            def run(self):
+                self.llm.analyze_function_batch("x" * 2000, model="claude-opus-5")
+
+        holder: dict[str, _CallingSupervisor] = {}
+
+        def make_supervisor(client, config, llm):
+            holder["supervisor"] = _CallingSupervisor(llm)
+            return holder["supervisor"]
+
+        controller = AnalysisController(
+            _settings(tmp_path),
+            ghidra_client_factory=lambda path, install_dir: MagicMock(),
+            llm_client_factory=lambda config: _Client(),
+            supervisor_factory=make_supervisor,
+        )
+        controller.start()
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                controller.poll()
+                if controller.state.llm_waiting:
+                    break
+                time.sleep(0.01)
+
+            state = controller.state
+            assert state.llm_waiting is True
+            assert state.llm_in_flight == 1
+            assert "claude-opus-5" in state.llm_wait_label
+            assert "batch of functions" in state.llm_wait_label
+            assert state.llm_wait_seconds >= 0
+        finally:
+            hold.set()
+            assert answered.wait(timeout=5)
+            controller._thread.join(timeout=5)
+
+        controller.poll()
+        assert controller.state.llm_waiting is False
+        assert controller.state.llm_answered == 1
+        assert controller.state.llm_wait_total_seconds > 0
+
+    def test_a_run_that_never_calls_the_model_never_says_it_is_waiting(self, tmp_path):
+        controller = _controller(_settings(tmp_path), _FakeSupervisor())
+        _run_to_completion(controller)
+
+        assert controller.state.llm_waiting is False
+        assert controller.state.llm_answered == 0
+
+    def test_a_second_run_starts_from_no_waiting_at_all(self, tmp_path):
+        controller = _controller(_settings(tmp_path), _FakeSupervisor())
+        controller.activity.end(controller.activity.begin("batch", "m"))
+        controller.poll()
+        assert controller.state.llm_answered == 1
+
+        _run_to_completion(controller)
+        assert controller.state.llm_answered == 0

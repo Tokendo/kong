@@ -46,6 +46,8 @@ Kong solves this by building rich context windows from Ghidra's program analysis
 - **Eval Framework**: Built-in evaluation harness that scores analysis output against ground-truth source code, measuring symbol accuracy (word-based Jaccard) and type accuracy (signature component scoring).
 - **Two-Model Passes**: A fast model can draft the easy functions and a stronger one re-read only what it got wrong, was unsure about, or was too large to be handed to it in the first place. One endpoint, one run, one report.
 - **Staged Passes**: The two passes also split apart. `--stage draft` reads every function with the cheap model and stops; the finishing pass — `--stage finish`, or the **Finish pass** button in the window — re-reads only what failed or came back under the threshold, once you have looked at what the draft produced. The expensive half becomes a decision rather than a consequence.
+- **Browser Interface**: `kong gui` serves a small page over loopback instead of a Tk window — the target, the provider, the budget, the live log, the recovered functions and the contradictions, in one place, on a Python build with no Tk bindings at all. It says when a request is out with the model and for how long, which is the stretch where a run looks hung and is not.
+- **Editable Token Budget**: How many tokens one request may spend on its answer is a field in the interface and `--max-output-tokens` on the command line, on every provider rather than only on a local endpoint.
 - **Multi-Provider LLM Support**: Works with Anthropic (Claude), OpenAI (GPT-4o) and Z.ai (GLM) out of the box, plus any OpenAI-compatible endpoint. An interactive setup wizard configures providers and smart routing auto-selects whichever has a valid key.
 - **Cost-Tracking**: Tracks token usage and costs per model across providers, with provider-aware pricing.
 
@@ -111,8 +113,8 @@ Kong uses a five-phase pipeline orchestrated by a supervisor that coordinates tr
                        ▼
             ┌──────────────────────┐
             │       Export         │
-            │  analysis.json +     │
-            │  Ghidra writeback    │
+            │  decompiled.c +      │
+            │  analysis.json       │
             └──────────────────────┘
 ```
 
@@ -266,7 +268,47 @@ URL. A server that reports nothing usable leaves the fields for you to fill.
 | `JAVA_HOME` | No | Path to JDK (auto-detected if not set) |
 | `KONG_CONFIG_DIR` | No | Override config directory (default: `~/.config/kong`) |
 
-### The window on Linux
+### The interface
+
+`kong gui` serves the interface on 127.0.0.1 and opens a browser at it:
+
+```bash
+kong gui                        # a free port, browser opened for you
+kong gui ./binary               # pre-fill the target
+kong gui --port 8765 --no-browser   # print the URL instead (remote box, over an SSH tunnel)
+kong gui --tk                   # the old desktop window
+```
+
+The URL carries a token minted for that process. Everything under `/api` needs
+it, so another page open in the same browser cannot start a run, read the paths
+you browse, or spend the key. Closing the tab leaves the run going; **Quit**
+stops it, checkpoints what it has done and releases Ghidra, the same as closing
+the window. The terminal that started it has to stay open.
+
+The left column is the run's configuration, the right one what the run is
+doing: progress, the live log, the functions as they come back, and the
+contradictions the coherence pass found. Between them are the counters — cost,
+tokens, elapsed, and **Waiting on model**, the share of the wall clock spent
+inside requests rather than in Ghidra.
+
+**Waiting on the model.** A chunk of forty functions can be out with the model
+for minutes with nothing else moving, which is indistinguishable from a hung
+program. The banner under the buttons says what is in flight — the model, the
+kind of call, how large the prompt is, what budget it was given — and counts
+the seconds; the badge in the title bar says the same thing when the page is
+scrolled. When nothing is in flight it reads *Model idle*, with how long the
+last answer took.
+
+**Token budget.** The **Token budget** card is what one request may spend:
+*Output tokens per request* caps a single answer (batch calls included),
+*Prompt chars* caps what is sent, and *Functions per batch* how much is asked
+for at once. Leave a field empty and the model's own figure is used. The budget
+now applies to every provider — in the desktop window it used to be dropped on
+anything but a local endpoint.
+
+### The desktop window on Linux
+
+The old Tk window is still there behind `kong gui --tk`.
 
 The interface picks a font the system actually has — `Ubuntu`, then
 `Cantarell`, `Noto Sans`, `DejaVu Sans` — instead of the `Roboto`
@@ -281,15 +323,16 @@ scaling under Wayland especially, where the result is either blurry or twice
 the intended size. Override it:
 
 ```bash
-kong gui --scale 1        # no scaling at all
-kong gui --scale 1.5      # half again as large
-KONG_UI_SCALE=1.25 kong gui
+kong gui --tk --scale 1        # no scaling at all
+kong gui --tk --scale 1.5      # half again as large
+KONG_UI_SCALE=1.25 kong gui --tk
 ```
 
 The flag turns Tk's own DPI guess off, so the number given is the one applied.
 
-If the GUI does not start at all, the Tk bindings are separate from Python on
-Debian and Ubuntu: `apt install python3-tk`.
+If the window does not start at all, the Tk bindings are separate from Python
+on Debian and Ubuntu: `apt install python3-tk`. The browser interface needs
+neither Tk nor customtkinter.
 
 ### API keys
 
@@ -317,9 +360,10 @@ the file.
 # Run the setup wizard
 kong setup
 
-# Open the graphical interface
+# Open the interface in a browser
 kong gui
 kong gui ./binary          # pre-fill the target
+kong gui --tk              # the old desktop window
 
 # Analyze a stripped binary (uses your configured default provider)
 kong analyze ./binary
@@ -437,9 +481,10 @@ large for that budget the call comes back empty — paid for in full — and the
 whole chunk is marked failed at once, which is what `spent its N-token budget
 without answering` in `events.log` means.
 
-In the window the field is **Functions per batch**, next to the two limits that
-only a local endpoint sets; it is blank on a hosted provider, meaning the
-model's own figure, and each provider keeps whatever you last typed for it.
+In the interface the field is **Functions per batch**, in the **Token budget**
+card beside **Output tokens per request**; it is blank on a hosted provider,
+meaning the model's own figure, and each provider keeps whatever you last typed
+for it.
 Lower it when `events.log` shows `no response for 0x...` lines, which is a model
 losing track of a long batch, or when a chunk failure comes back as an HTTP 429.
 
@@ -571,6 +616,12 @@ model answered for each function, which is what makes that distinction
 survive the process.
 
 ### Reconstruction in another language
+
+The writeback into Ghidra is not one of the formats: names, types and
+signatures are written into the program database as each function is analyzed,
+whatever is selected. `--format ghidra` therefore writes no file — it is still
+accepted so older command lines keep running, and the interfaces no longer
+offer it.
 
 `--format python` or `--format csharp` adds a translation of the recovered C,
 written as `decompiled.py` or `Decompiled.cs`:

@@ -76,6 +76,15 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
     from kong.llm.usage import register_custom_model
 
     model = config.model or _DEFAULT_MODELS.get(config.provider, "gpt-4o")
+    # The per-request output budget. It is the same number for every provider:
+    # a single-function call opens on the client's default (2048) and a batch
+    # call is sized by the model table, and this is what overrides both when
+    # the user has an opinion about how much one request may spend.
+    budget: dict[str, object] = (
+        {"max_tokens": config.max_output_tokens}
+        if config.max_output_tokens is not None
+        else {}
+    )
     if config.provider is LLMProvider.CUSTOM:
         # The draft model is billed and reported separately, so it needs a
         # pricing entry of its own or the usage table drops what it spent.
@@ -86,16 +95,11 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
         # A dummy value satisfies the SDK while local servers ignore it.
         api_key = config.api_key if config.api_key else _NOT_NEEDED_STR
         register_custom_model(model)
-        kwargs: dict[str, object] = {}
-        if config.max_output_tokens is not None:
-            # A local server sized for a small context cannot honour the
-            # default single-call output budget.
-            kwargs["max_tokens"] = config.max_output_tokens
         return OpenAIClient(
             model=model,
             base_url=config.base_url,
             api_key=api_key,
-            **kwargs,
+            **budget,
         )
     if config.provider is LLMProvider.ZAI:
         # OpenAI-compatible surface, but the key lives under its own name: the
@@ -111,15 +115,18 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
             model=model,
             base_url=config.base_url or ZAI_BASE_URL,
             api_key=api_key,
+            **budget,
         )
     if config.provider is LLMProvider.OPENAI:
         return OpenAIClient(
             model=model,
             api_key=resolve_api_key(LLMProvider.OPENAI, config.api_key),
+            **budget,
         )
     return AnthropicClient(
         model=model,
         api_key=resolve_api_key(LLMProvider.ANTHROPIC, config.api_key),
+        **budget,
     )
 
 
@@ -320,7 +327,9 @@ def _print_final_stats(supervisor: Supervisor, llm_client: LLMClient) -> None:
     help=(
         "Output formats. 'python' and 'csharp' add a reconstruction of the "
         "recovered C in that language, which costs a second LLM pass over the "
-        "whole binary."
+        "whole binary. 'ghidra' writes no file and is kept only so older "
+        "command lines still run: names and types reach the program database "
+        "during the analysis, whatever is asked for here."
     ),
 )
 @click.option(
@@ -387,7 +396,15 @@ def _print_final_stats(supervisor: Supervisor, llm_client: LLMClient) -> None:
         "missing functions."
     ),
 )
-@click.option("--max-output-tokens", type=int, default=None, help="Override output token limit.")
+@click.option(
+    "--max-output-tokens",
+    type=int,
+    default=None,
+    help=(
+        "Token budget for one request's answer, on any provider. Leave it out "
+        "to use the model's own figure."
+    ),
+)
 @click.pass_context
 def analyze(
     ctx: click.Context,
@@ -691,25 +708,63 @@ def models(base_url: str | None) -> None:
 @cli.command()
 @click.argument("binary", type=click.Path(exists=True, dir_okay=False), required=False)
 @click.option(
+    "--tk",
+    "use_tk",
+    is_flag=True,
+    help="Open the old desktop window instead of the browser interface.",
+)
+@click.option(
+    "--port",
+    type=click.IntRange(0, 65535),
+    default=0,
+    help="Port to serve the interface on. 0 picks a free one.",
+)
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    help="Print the URL instead of opening a browser (remote or headless box).",
+)
+@click.option(
     "--scale",
     type=click.FloatRange(0.5, 4.0),
     default=None,
     help=(
-        "Size of the interface, for when Tk misreads the screen: 1 pins it "
+        "Size of the --tk window, for when Tk misreads the screen: 1 pins it "
         "to no scaling, 1.5 enlarges it by half. Also read from KONG_UI_SCALE."
     ),
 )
-def gui(binary: str | None, scale: float | None) -> None:
-    """Open the graphical interface."""
+def gui(
+    binary: str | None,
+    use_tk: bool,
+    port: int,
+    no_browser: bool,
+    scale: float | None,
+) -> None:
+    """Open the interface: a page in your browser, or --tk for the window."""
+    initial_binary = str(Path(binary).resolve()) if binary else ""
+
+    if not use_tk:
+        # Nothing but the standard library, so this is also the interface that
+        # works on a Python build without Tk bindings.
+        from kong.webui import launch as launch_web
+
+        launch_web(
+            initial_binary=initial_binary,
+            port=port,
+            open_browser=not no_browser,
+        )
+        return
+
     try:
         from kong.gui.app import UI_SCALE_ENV, launch
     except ImportError as e:  # Tk is optional in some Python builds
-        console.print(f"[red]The graphical interface is not available:[/red] "
+        console.print(f"[red]The desktop window is not available:[/red] "
                       f"{escape(str(e))}")
         console.print(
             "It needs customtkinter and the Tk bindings for your Python "
-            "(Debian/Ubuntu: [bold]apt install python3-tk[/bold]), "
-            "or use [bold]kong analyze[/bold] instead."
+            "(Debian/Ubuntu: [bold]apt install python3-tk[/bold]). "
+            "Drop [bold]--tk[/bold] for the browser interface, which needs "
+            "neither."
         )
         raise SystemExit(1) from e
 
@@ -718,7 +773,7 @@ def gui(binary: str | None, scale: float | None) -> None:
         # disagree about which one wins.
         os.environ[UI_SCALE_ENV] = str(scale)
 
-    launch(initial_binary=str(Path(binary).resolve()) if binary else "")
+    launch(initial_binary=initial_binary)
 
 
 @cli.command()

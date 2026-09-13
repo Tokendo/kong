@@ -207,6 +207,20 @@ class TestCreateLLMClient:
 
 
 class TestGuiCommand:
+    def test_the_browser_interface_is_what_opens(self, monkeypatch):
+        """Tk is the fallback now, so plain `kong gui` serves the page."""
+        seen = {}
+
+        def fake_launch(initial_binary="", port=0, open_browser=True):
+            seen.update(binary=initial_binary, port=port, browser=open_browser)
+
+        monkeypatch.setattr("kong.webui.launch", fake_launch)
+
+        result = CliRunner().invoke(cli, ["gui", "--port", "8899", "--no-browser"])
+
+        assert result.exit_code == 0
+        assert seen == {"binary": "", "port": 8899, "browser": False}
+
     def test_the_scale_flag_reaches_the_window(self, monkeypatch):
         pytest.importorskip("customtkinter")
         from kong.gui.app import UI_SCALE_ENV
@@ -219,13 +233,13 @@ class TestGuiCommand:
 
         monkeypatch.setattr("kong.gui.app.launch", fake_launch)
 
-        result = CliRunner().invoke(cli, ["gui", "--scale", "1.25"])
+        result = CliRunner().invoke(cli, ["gui", "--tk", "--scale", "1.25"])
 
         assert result.exit_code == 0
         assert seen["scale"] == "1.25"
 
     def test_an_impossible_scale_is_refused(self):
-        result = CliRunner().invoke(cli, ["gui", "--scale", "40"])
+        result = CliRunner().invoke(cli, ["gui", "--tk", "--scale", "40"])
 
         assert result.exit_code != 0
 

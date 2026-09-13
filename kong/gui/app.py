@@ -133,10 +133,12 @@ DEFAULT_MODEL_HINTS = {
     LLMProvider.ZAI.value: "glm-5.3",
 }
 
+#: Files the export phase actually writes. Ghidra is not one of them: names
+#: and types are written into the program database as each function is
+#: analyzed, not at the end and not on request.
 OUTPUT_FORMATS: list[tuple[str, str]] = [
     ("source", "C source"),
     ("json", "JSON"),
-    ("ghidra", "Ghidra writeback"),
     ("python", "Python"),
     ("csharp", "C#"),
 ]
@@ -282,6 +284,13 @@ class KongWindow(ctk.CTkFrame):
             LLMProvider.CUSTOM.value: str(defaults.max_chunk_functions),
         }
         self._chunk_owner = LLMProvider.CUSTOM.value
+        # The output budget is per provider for the same reason: a local
+        # server needs a figure that fits the window it was started with,
+        # while a hosted model has one of its own. Blank means "the model's".
+        self._output_tokens = {
+            LLMProvider.CUSTOM.value: str(defaults.max_output_tokens),
+        }
+        self._output_tokens_owner = LLMProvider.CUSTOM.value
         self.status_var = tk.StringVar(value="Idle.")
 
         self.grid(sticky="nsew", padx=10, pady=10)
@@ -471,21 +480,25 @@ class KongWindow(ctk.CTkFrame):
 
         self.limits_frame = ctk.CTkFrame(frame, fg_color="transparent")
         self.limits_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(6, 0))
-        # Only the two that describe the endpoint's window: the batch entry
-        # below stays open on every provider, so it is not in this list.
-        self.limit_entries: list[ctk.CTkEntry] = []
-        for column, (label, var) in enumerate(
-            (
-                ("Max prompt chars", self.prompt_chars_var),
-                ("Max output tokens", self.output_tokens_var),
-            )
-        ):
-            ctk.CTkLabel(self.limits_frame, text=label).grid(
-                row=0, column=column * 2, sticky="w", padx=(0 if column == 0 else 12, 6)
-            )
-            entry = ctk.CTkEntry(self.limits_frame, textvariable=var, width=96)
-            entry.grid(row=0, column=column * 2 + 1, sticky="w")
-            self.limit_entries.append(entry)
+        # Prompt chars describes the endpoint's own window, so it is the one
+        # field that only means something on a local server. The two budget
+        # entries beside it apply to every provider.
+        ctk.CTkLabel(self.limits_frame, text="Max prompt chars").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        self.prompt_chars_entry = ctk.CTkEntry(
+            self.limits_frame, textvariable=self.prompt_chars_var, width=96
+        )
+        self.prompt_chars_entry.grid(row=0, column=1, sticky="w")
+        self.limit_entries: list[ctk.CTkEntry] = [self.prompt_chars_entry]
+
+        ctk.CTkLabel(self.limits_frame, text="Tokens per request").grid(
+            row=0, column=2, sticky="w", padx=(12, 6)
+        )
+        self.output_tokens_entry = ctk.CTkEntry(
+            self.limits_frame, textvariable=self.output_tokens_var, width=96
+        )
+        self.output_tokens_entry.grid(row=0, column=3, sticky="w")
 
         ctk.CTkLabel(self.limits_frame, text="Functions per batch").grid(
             row=0, column=4, sticky="w", padx=(12, 6)
@@ -498,10 +511,12 @@ class KongWindow(ctk.CTkFrame):
         self.limits_hint = ctk.CTkLabel(
             self.limits_frame,
             text=(
-                f"(prompt chars and output tokens: local endpoints only, "
-                f"sized for a {DEFAULT_CONTEXT_TOKENS // 1024}k context, "
-                f"Detect reads the real one. Functions per batch applies to "
-                f"every provider; blank means the model's own figure.)"
+                f"(prompt chars: local endpoints only, sized for a "
+                f"{DEFAULT_CONTEXT_TOKENS // 1024}k context, Detect reads the "
+                f"real one. Tokens per request caps what one call may spend on "
+                f"its answer, and functions per batch how much it is asked for "
+                f"— both apply to every provider; blank means the model's own "
+                f"figure.)"
             ),
             anchor="w",
             text_color=TAG_COLORS["muted"],
@@ -649,14 +664,16 @@ class KongWindow(ctk.CTkFrame):
 
     def _sync_format_hint(self) -> None:
         chosen = [f for f in TRANSPILE_FORMATS if self.format_vars[f].get()]
-        self.format_hint.configure(
-            text=(
-                "Python/C# is a readable reconstruction, not a runnable port, "
-                "and costs a second LLM pass over the binary."
-                if chosen
-                else ""
+        # The writeback is not in the list because it is not optional: saying
+        # so here is what keeps a shorter list from reading like a lost
+        # feature.
+        hint = "Names and types go back into Ghidra as the run goes, either way."
+        if chosen:
+            hint += (
+                "\nPython/C# is a readable reconstruction, not a runnable "
+                "port, and costs a second LLM pass over the binary."
             )
-        )
+        self.format_hint.configure(text=hint)
 
     def on_detect_endpoint(self) -> None:
         """Ask the endpoint what it serves, and size the limits from it."""
@@ -708,6 +725,13 @@ class KongWindow(ctk.CTkFrame):
             self._chunk_sizes[self._chunk_owner] = self.chunk_functions_var.get().strip()
             self.chunk_functions_var.set(self._chunk_sizes.get(provider, ""))
             self._chunk_owner = provider
+
+        if provider != self._output_tokens_owner:
+            self._output_tokens[self._output_tokens_owner] = (
+                self.output_tokens_var.get().strip()
+            )
+            self.output_tokens_var.set(self._output_tokens.get(provider, ""))
+            self._output_tokens_owner = provider
 
         self.base_url_entry.configure(state="normal" if has_base_url else "disabled")
         # Detect asks the endpoint what it serves; Z.ai does not answer that.
@@ -809,9 +833,10 @@ class KongWindow(ctk.CTkFrame):
             max_chunk_functions=self._parse_optional_int(
                 self.chunk_functions_var.get()
             ),
-            max_output_tokens=self._parse_optional_int(self.output_tokens_var.get())
-            if is_custom
-            else None,
+            # How many tokens one request may spend on its answer is a
+            # question a hosted endpoint answers too, so this is not
+            # custom-only: blank leaves the model's own figure in place.
+            max_output_tokens=self._parse_optional_int(self.output_tokens_var.get()),
             stage=RunStage.DRAFT if self.draft_only_var.get() else RunStage.FULL,
         )
 
@@ -1007,6 +1032,11 @@ class KongWindow(ctk.CTkFrame):
             f"${state.cost_usd:.4f}",
             f"{state.elapsed_seconds:.0f}s",
         ]
+        if state.llm_waiting:
+            # Minutes can pass inside one request with nothing else moving,
+            # which is the stretch that otherwise looks like a hung window.
+            waiting = f"waiting on {state.llm_wait_label or 'the model'}"
+            pieces.append(f"{waiting} ({state.llm_wait_seconds:.0f}s)")
         if state.paused:
             pieces.append("PAUSED")
         if state.pending_finish:
