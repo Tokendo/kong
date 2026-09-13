@@ -122,3 +122,76 @@ from each function header to populate the address field.
 ```
 
 {_CLASSIFICATION_AND_CONFIDENCE}"""
+
+
+_TRANSPILE_RULES = """\
+What you produce is a readable reconstruction, not a runnable port. Decompiler \
+output contains raw memory access, pointer arithmetic and calling conventions \
+that have no faithful equivalent in a managed language. Prefer honesty over \
+plausible-looking code:
+
+- Preserve the control flow and the recovered names exactly; do not restructure \
+logic to look nicer, and do not rename anything
+- Translate pointer arithmetic into explicit indexing on a buffer parameter, and \
+keep the original expression in a trailing comment
+- Where a construct cannot be expressed faithfully (raw memory writes, inline \
+assembly, syscalls, setjmp, function pointers into arbitrary addresses), emit a \
+clearly marked comment saying so instead of inventing an equivalent
+- Do not invent library calls, imports or using-directives to make code look \
+complete; only reference what the decompilation actually shows
+- Keep undefined/unknown types explicit rather than guessing a concrete type
+- No prose outside the code, and no explanation of your translation choices"""
+
+
+_TRANSPILE_TARGETS: dict[str, str] = {
+    "python": """\
+Target: Python 3.11+.
+- One module-level function per input function, snake_case, no class wrapper
+- Add type hints only where the recovered signature justifies them
+- Represent a byte buffer parameter as `bytearray`, an address as `int`
+- Use a docstring holding the original address, the confidence and the comment
+- Do not import anything unless the decompilation clearly requires it""",
+    "csharp": """\
+Target: C# 12.
+- One `public static` method per input function, PascalCase name, inside the \
+class the file already opens; emit the method only, no class or namespace \
+declaration
+- Represent a byte buffer parameter as `byte[]`, an address as `ulong`
+- Use a `///  <summary>` doc comment holding the original address, the \
+confidence and the comment
+- Do not add using-directives; the file header already provides them""",
+}
+
+
+TRANSPILE_SYSTEM_PROMPT = f"""\
+You translate Ghidra decompiler output into another language for a reverse \
+engineer to read. You are given decompiled C functions that have already been \
+named and typed by an analysis pass.
+
+{_TRANSPILE_RULES}
+
+You respond only with a JSON array. No prose before or after."""
+
+
+TRANSPILE_OUTPUT_SCHEMA = """\
+Respond with exactly one JSON array, one object per input function, using the \
+address from each function header:
+```json
+[
+  {
+    "address": "0x00401000",
+    "code": "<the translated function, newlines escaped as \n>",
+    "faithful": true,
+    "notes": "What could not be translated faithfully, or an empty string"
+  }
+]
+```
+
+Set "faithful" to false whenever the translation loses behaviour — raw memory \
+access, pointer casts, inline assembly, or anything you had to replace with a \
+comment. An honest false is more useful than an optimistic true."""
+
+
+def transpile_target_rules(language: str) -> str:
+    """Language-specific instructions appended to the transpile prompt."""
+    return _TRANSPILE_TARGETS[language]

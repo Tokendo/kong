@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from kong.config import LLMProvider
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -24,10 +27,20 @@ _DEFAULT_PRICING = PricingTier(input_rate=3.0, output_rate=15.0)
 
 PRICING_REGISTRY: dict[str, PricingTier] = {
     # Anthropic: cache_write = input * 1.25, cache_read = input * 0.10
+    "claude-fable-5": PricingTier(10.0, 50.0, cache_write_rate=12.50, cache_read_rate=1.00),
+    "claude-opus-5": PricingTier(5.0, 25.0, cache_write_rate=6.25, cache_read_rate=0.50),
+    "claude-opus-4-8": PricingTier(5.0, 25.0, cache_write_rate=6.25, cache_read_rate=0.50),
+    "claude-opus-4-7": PricingTier(5.0, 25.0, cache_write_rate=6.25, cache_read_rate=0.50),
     "claude-opus-4-6": PricingTier(5.0, 25.0, cache_write_rate=6.25, cache_read_rate=0.50),
+    "claude-sonnet-5": PricingTier(2.0, 10.0, cache_write_rate=2.50, cache_read_rate=0.20),
     "claude-sonnet-4-6": PricingTier(3.0, 15.0, cache_write_rate=3.75, cache_read_rate=0.30),
     "claude-sonnet-4-20250514": PricingTier(3.0, 15.0, cache_write_rate=3.75, cache_read_rate=0.30),
+    "claude-haiku-4-5": PricingTier(1.0, 5.0, cache_write_rate=1.25, cache_read_rate=0.10),
     "claude-haiku-4-5-20251001": PricingTier(1.0, 5.0, cache_write_rate=1.25, cache_read_rate=0.10),
+    # Z.ai: published rates for GLM-5.3, cached input billed separately.
+    # glm-5.3-flash is deliberately absent: its rate is not published next to
+    # the flagship one, and a guessed number reads like a measured one.
+    "glm-5.3": PricingTier(1.40, 4.40, cache_read_rate=0.26),
     # OpenAI: cached input is 50% of input rate, no cache write billing
     "gpt-4o": PricingTier(2.50, 10.00, cache_read_rate=1.25),
     "gpt-4o-2024-11-20": PricingTier(2.50, 10.00, cache_read_rate=1.25),
@@ -41,10 +54,34 @@ PRICING_REGISTRY: dict[str, PricingTier] = {
 _ZERO_PRICING = PricingTier(0.0, 0.0, 0.0, 0.0)
 
 
+_warned_unknown_models: set[str] = set()
+
+
+def is_known_model(model: str) -> bool:
+    """True if *model* has published rates in the registry.
+
+    Costs reported for an unknown model are estimates based on
+    ``_DEFAULT_PRICING``, not that model's real rates.
+    """
+    return model in PRICING_REGISTRY
+
+
 def get_pricing(model: str, provider: LLMProvider | None = None) -> PricingTier:
     if provider is LLMProvider.CUSTOM:
         return _ZERO_PRICING
-    return PRICING_REGISTRY.get(model, _DEFAULT_PRICING)
+    tier = PRICING_REGISTRY.get(model)
+    if tier is None:
+        # Falling back silently makes a wrong cost look like a measured one.
+        if model not in _warned_unknown_models:
+            _warned_unknown_models.add(model)
+            logger.warning(
+                "No published pricing for model %r; reporting costs at the "
+                "default rate ($%.2f in / $%.2f out per 1M tokens). The real "
+                "cost may differ.",
+                model, _DEFAULT_PRICING.input_rate, _DEFAULT_PRICING.output_rate,
+            )
+        return _DEFAULT_PRICING
+    return tier
 
 
 def register_custom_model(model: str) -> None:

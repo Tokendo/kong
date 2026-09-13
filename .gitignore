@@ -210,12 +210,14 @@ marimo/_lsp/
 __marimo__/
 
 #internal binaries
-.gpr
-.pak
-.bak
-.dat
-.gbf
-.plist
+#   Written with a leading dot these matched a file *named* .gpr and nothing
+#   else, so none of them ever ignored anything. The glob is what was meant.
+*.gpr
+*.pak
+*.bak
+*.dat
+*.gbf
+*.plist
 
 #internal testing
 internal-testing/
@@ -235,3 +237,35 @@ tools/xda/corpus/
 # Added by cargo
 
 /target
+
+# Kong run artifacts
+#   The default output directory is ./kong_output, or kong_output_<binary> when
+#   the window names it from the target, so a run started from the repo root
+#   drops its results here: recovered names, decompiled C, the resumable
+#   checkpoint, the coherence report and the event trace.
+#   kong_output_liblzma is the exception — it is the benchmark output
+#   BENCHMARKS.md refers to, and belongs in the repository.
+/kong_output/
+/kong_output_*/
+!/kong_output_liblzma/
+analysis_state.json
+coherence.json
+events.log*
+
+# Analysis logs kept aside for inspection, copied out of a run's output
+# directory rather than written there by Kong.
+/Log/
+
+# Credentials
+#   Kong keeps saved API keys in a SQLite store under ~/.config/kong, outside
+#   any repository — but KONG_CONFIG_DIR moves that store anywhere, including
+#   here, and a key pointed at a working tree is one `git add .` from being
+#   published. Nothing else in Kong writes a key to disk: it reaches the client
+#   from the environment or from that store, and neither the export nor
+#   events.log carries it.
+config.db
+kong-config/
+.env.*
+*.key
+*.pem
+secrets.*

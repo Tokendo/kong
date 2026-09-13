@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from kong.config import LLMProvider
 from kong.db import (
+    api_key_config_key,
     get_custom_config,
     get_default_provider,
     get_enabled_providers,
     is_setup_complete,
+    get_saved_api_key,
     read_config,
+    save_api_key,
     save_setup,
     write_config,
 )
@@ -136,3 +139,52 @@ class TestCustomConfig:
         assert get_default_provider() == LLMProvider.ANTHROPIC
         cfg = get_custom_config()
         assert cfg == {}
+
+
+class TestApiKeys:
+    def test_no_key_saved_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+
+        assert get_saved_api_key(LLMProvider.ZAI) is None
+
+    def test_a_saved_key_comes_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+
+        save_api_key(LLMProvider.ZAI, "zai-secret")
+
+        assert get_saved_api_key(LLMProvider.ZAI) == "zai-secret"
+
+    def test_keys_are_kept_per_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+
+        save_api_key(LLMProvider.ZAI, "zai-secret")
+        save_api_key(LLMProvider.ANTHROPIC, "sk-ant-secret")
+
+        assert get_saved_api_key(LLMProvider.ZAI) == "zai-secret"
+        assert get_saved_api_key(LLMProvider.ANTHROPIC) == "sk-ant-secret"
+
+    def test_saving_an_empty_key_forgets_it(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        save_api_key(LLMProvider.ZAI, "zai-secret")
+
+        save_api_key(LLMProvider.ZAI, "   ")
+
+        assert get_saved_api_key(LLMProvider.ZAI) is None
+
+    def test_surrounding_spaces_are_not_part_of_the_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+
+        save_api_key(LLMProvider.ZAI, "  zai-secret\n")
+
+        assert get_saved_api_key(LLMProvider.ZAI) == "zai-secret"
+
+    def test_the_custom_key_keeps_the_name_setup_already_writes(
+        self, tmp_path, monkeypatch,
+    ):
+        """kong setup has written custom_api_key since before this existed."""
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        write_config("custom_api_key", "from-the-wizard")
+
+        assert api_key_config_key(LLMProvider.CUSTOM) == "custom_api_key"
+        assert get_saved_api_key(LLMProvider.CUSTOM) == "from-the-wizard"
+        assert get_custom_config()["custom_api_key"] == "from-the-wizard"

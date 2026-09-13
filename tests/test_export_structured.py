@@ -279,3 +279,92 @@ class TestCostTrackingField:
         data.provider = LLMProvider.CUSTOM
         parsed = _export_and_load(data, tmp_path)
         assert parsed["stats"]["cost_tracking"] is False
+
+
+class TestFailures:
+    """A failed function is listed, not dropped."""
+
+    def test_failures_are_exported(self, tmp_path, binary_info, stats):
+        data = ExportData(
+            binary_info=binary_info,
+            stats=stats,
+            results={
+                0x401000: FunctionResult(
+                    address=0x401000, original_name="FUN_00401000", name="parse",
+                ),
+                0x401A30: FunctionResult(
+                    address=0x401A30,
+                    original_name="FUN_00401a30",
+                    error="HTTP 429: Too Many Requests",
+                ),
+            },
+            decompilations={},
+            token_usage=TokenUsage(),
+            duration_seconds=1.0,
+            provider=LLMProvider.ANTHROPIC,
+        )
+
+        path = export_json(data, tmp_path / "analysis.json")
+        document = json.loads(path.read_text())
+
+        assert [f["name"] for f in document["functions"]] == ["parse"]
+        assert document["failures"] == [{
+            "address": "0x00401a30",
+            "original_name": "FUN_00401a30",
+            "error": "HTTP 429: Too Many Requests",
+        }]
+
+    def test_a_clean_run_has_an_empty_failure_list(self, tmp_path, binary_info, stats):
+        data = ExportData(
+            binary_info=binary_info,
+            stats=stats,
+            results={
+                0x401000: FunctionResult(
+                    address=0x401000, original_name="FUN_00401000", name="parse",
+                ),
+            },
+            decompilations={},
+            token_usage=TokenUsage(),
+            duration_seconds=1.0,
+            provider=LLMProvider.ANTHROPIC,
+        )
+
+        path = export_json(data, tmp_path / "analysis.json")
+
+        assert json.loads(path.read_text())["failures"] == []
+
+
+class TestTwoPassFields:
+    """A two-model run has to be readable back out of analysis.json."""
+
+    def _entry(self, tmp_path, binary_info, stats, **kwargs):
+        result = FunctionResult(
+            address=0x1000, original_name="FUN_00001000", name="parse_header",
+            confidence=90, **kwargs,
+        )
+        data = ExportData(
+            binary_info=binary_info,
+            stats=stats,
+            results={0x1000: result},
+            decompilations={},
+            token_usage=TokenUsage(),
+            duration_seconds=1.0,
+            provider=LLMProvider.ANTHROPIC,
+        )
+        path = export_json(data, tmp_path / "analysis.json")
+        return json.loads(path.read_text())["functions"][0]
+
+    def test_the_model_that_named_it_is_exported(
+        self, tmp_path, binary_info, stats,
+    ):
+        entry = self._entry(tmp_path, binary_info, stats, model="fast-model")
+
+        assert entry["model"] == "fast-model"
+        assert entry["refined"] is False
+
+    def test_a_refined_function_says_so(self, tmp_path, binary_info, stats):
+        entry = self._entry(
+            tmp_path, binary_info, stats, model="strong-model", refined=True,
+        )
+
+        assert entry["refined"] is True

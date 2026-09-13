@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from kong.agent.analyzer import strip_markdown_fences
 from kong.agent.models import FunctionResult
+from kong.llm.limits import take_within_budget
 
 if TYPE_CHECKING:
     from kong.agent.analyzer import LLMClient
@@ -33,8 +34,9 @@ class SemanticSynthesizer:
     """Makes one LLM call over complete post-naming analysis to unify globals, synthesize structs,
     and refine names."""
 
-    def __init__(self, llm: LLMClient) -> None:
+    def __init__(self, llm: LLMClient, max_prompt_chars: int | None = None) -> None:
         self.llm = llm
+        self.max_prompt_chars = max_prompt_chars
 
     def synthesize(
         self,
@@ -87,26 +89,54 @@ class SemanticSynthesizer:
             name: addrs for name, addrs in globals_map.items() if len(addrs) >= 2
         }
 
+        def render_global(entry: tuple[str, set[int]]) -> str:
+            dat_name, addrs = entry
+            func_names = [
+                (results_by_addr[addr].name if addr in results_by_addr else f"FUN_{addr:08x}")
+                for addr in sorted(addrs)
+            ]
+            return f"- `{dat_name}` referenced by: {', '.join(func_names)}"
+
         if multi_use_globals:
-            parts.append("")
-            parts.append("## Global Variables")
-            parts.append("")
-            for dat_name, addrs in sorted(multi_use_globals.items()):
-                func_names = []
-                for addr in sorted(addrs):
-                    r = results_by_addr.get(addr)
-                    label = r.name if r else f"FUN_{addr:08x}"
-                    func_names.append(label)
-                parts.append(f"- `{dat_name}` referenced by: {', '.join(func_names)}")
+            entries = sorted(multi_use_globals.items())
+            if self.max_prompt_chars is not None:
+                entries = take_within_budget(
+                    entries, render_global, self.max_prompt_chars // 10
+                )
+            if entries:
+                parts.append("")
+                parts.append("## Global Variables")
+                parts.append("")
+                parts.extend(render_global(entry) for entry in entries)
 
         parts.append("")
         parts.append("## Functions and Decompilations")
         parts.append("")
 
+        def render_function(result: FunctionResult) -> str:
+            return "\n".join([
+                f"### {result.name} (0x{result.address:08x})",
+                f"Classification: {result.classification}, Confidence: {result.confidence}",
+                "```c",
+                decompilations[result.address],
+                "```",
+                "",
+            ])
+
         eligible = [r for r in results if r.address in decompilations]
-        if len(eligible) > SYNTHESIS_FUNCTION_CAP:
-            eligible.sort(key=lambda r: xref_counts.get(r.address, 0), reverse=True)
-            eligible = eligible[:SYNTHESIS_FUNCTION_CAP]
+        # Most cross-referenced first: those carry the most shared structure, so
+        # they are the ones worth keeping when the budget runs out.
+        eligible.sort(key=lambda r: xref_counts.get(r.address, 0), reverse=True)
+        eligible = eligible[:SYNTHESIS_FUNCTION_CAP]
+
+        if self.max_prompt_chars is not None:
+            # Whole decompilations go in here, so it is this section — not the
+            # function count — that decides whether the prompt fits a context
+            # window. One 50-function pass is otherwise unbounded.
+            spent = sum(len(part) + 1 for part in parts)
+            eligible = take_within_budget(
+                eligible, render_function, max(0, self.max_prompt_chars - spent)
+            )
 
         for result in eligible:
             parts.append(f"### {result.name} (0x{result.address:08x})")

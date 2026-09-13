@@ -41,27 +41,40 @@ class AnalysisStats:
         return self.named / self.total_functions if self.total_functions else 0.0
 
     def record_result(self, result: FunctionResult) -> None:
+        self._apply(result, 1)
+
+    def replace_result(self, previous: FunctionResult, result: FunctionResult) -> None:
+        """Swap an already-recorded result for a new one.
+
+        The second analysis pass re-analyzes functions the draft pass already
+        recorded. Recording the new result on top would count the function
+        twice, in two different confidence buckets.
+        """
+        self._apply(previous, -1)
+        self._apply(result, 1)
+
+    def _apply(self, result: FunctionResult, sign: int) -> None:
         if result.skipped:
-            self.skipped += 1
+            self.skipped += sign
             return
         if result.error:
-            self.errors += 1
+            self.errors += sign
             return
-        self.analyzed += 1
-        self.llm_calls += result.llm_calls
+        self.analyzed += sign
+        self.llm_calls += sign * result.llm_calls
         if result.name:
             if result.name != result.original_name:
-                self.renamed += 1
+                self.renamed += sign
             else:
-                self.confirmed += 1
+                self.confirmed += sign
         # TODO: calibrate these eventually. these buckets are arbitrary, need eval data to
         # determine meaningful confidence tiers for the LLM's self-reported scores.
         if result.confidence >= 80:
-            self.high_confidence += 1
+            self.high_confidence += sign
         elif result.confidence >= 50:
-            self.medium_confidence += 1
+            self.medium_confidence += sign
         else:
-            self.low_confidence += 1
+            self.low_confidence += sign
 
 
 @dataclass
@@ -76,6 +89,11 @@ class FunctionResult:
     comments: str = ""
     reasoning: str = ""
     error: str = ""
+    #: Model that produced this result. Tells the second pass what the first
+    #: one answered with, so it never re-reads its own work.
+    model: str = ""
+    #: True once the second pass has re-analyzed this function.
+    refined: bool = False
     llm_calls: int = 0
     skipped: bool = False
     skip_reason: str = ""

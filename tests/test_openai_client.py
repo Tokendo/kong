@@ -333,3 +333,51 @@ class TestOpenAICostCalculation:
         )
         cost = mu.cost_usd("gpt-4o")
         assert cost == 1.25
+
+
+class TestOutputTokenBudget:
+    """A llama.cpp server sized for a small context cannot serve 16k output tokens."""
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_batch_defaults_to_the_full_budget(self, mock_openai_cls):
+        from kong.llm.openai_client import DEFAULT_BATCH_MAX_TOKENS
+
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response(
+            '[{"name": "f", "confidence": 50}]'
+        )
+
+        client = OpenAIClient(api_key="test-key")
+        client.analyze_function_batch("prompt")
+
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == DEFAULT_BATCH_MAX_TOKENS
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_batch_honours_an_explicit_budget(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response(
+            '[{"name": "f", "confidence": 50}]'
+        )
+
+        client = OpenAIClient(api_key="test-key")
+        client.analyze_function_batch("prompt", max_tokens=1024)
+
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 1024
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_single_call_budget_is_configurable(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response(
+            '{"name": "f", "confidence": 50}'
+        )
+
+        client = OpenAIClient(api_key="test-key", max_tokens=512)
+        client.analyze_function("prompt")
+
+        kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 512

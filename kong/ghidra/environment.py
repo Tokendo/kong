@@ -12,9 +12,79 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+_IS_WINDOWS = os.name == "nt"
+
+
+def _java_executable(java_home: str | Path) -> Path:
+    """Path to the java binary inside *java_home* (``java.exe`` on Windows)."""
+    return Path(java_home) / "bin" / ("java.exe" if _IS_WINDOWS else "java")
+
+
+def _expand_globs(patterns: list[str]) -> list[str]:
+    """Expand *patterns*, newest-looking match first, skipping non-directories."""
+    seen: list[str] = []
+    for pattern in patterns:
+        for candidate in sorted(_glob.glob(pattern), reverse=True):
+            if Path(candidate).is_dir() and candidate not in seen:
+                seen.append(candidate)
+    return seen
+
+
+def _windows_program_dirs() -> list[str]:
+    """Root directories where Windows installers place JDKs and tools."""
+    roots = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles(x86)"),
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("USERPROFILE"),
+        "C:\\",
+    ]
+    return [r for r in roots if r]
+
+
+def _windows_jdk_candidates() -> list[str]:
+    """Common Windows JDK install locations, newest first."""
+    if not _IS_WINDOWS:
+        return []
+    patterns = []
+    for root in _windows_program_dirs():
+        patterns.extend([
+            str(Path(root) / "Eclipse Adoptium" / "jdk-*"),
+            str(Path(root) / "Java" / "jdk-*"),
+            str(Path(root) / "Microsoft" / "jdk-*"),
+            str(Path(root) / "Amazon Corretto" / "jdk*"),
+            str(Path(root) / "Zulu" / "zulu-*"),
+            str(Path(root) / "Programs" / "Eclipse Adoptium" / "jdk-*"),
+        ])
+    return _expand_globs(patterns)
+
+
+def _windows_ghidra_candidates() -> list[str]:
+    """Common Windows Ghidra install locations, newest first."""
+    if not _IS_WINDOWS:
+        return []
+    patterns = []
+    for root in _windows_program_dirs():
+        patterns.extend([
+            str(Path(root) / "ghidra*"),
+            str(Path(root) / "Ghidra*"),
+            str(Path(root) / "ghidra*" / "ghidra_*"),
+        ])
+    return _expand_globs(patterns)
+
+
+def _is_ghidra_dir(path: Path) -> bool:
+    """True if *path* looks like a Ghidra installation root."""
+    support = path / "support"
+    return (support / "analyzeHeadless").exists() or (
+        support / "analyzeHeadless.bat"
+    ).exists()
+
+
 def _java_version(java_home: str) -> int | None:
     """Return the major version of the JDK at *java_home*, or None on failure."""
-    java_bin = Path(java_home) / "bin" / "java"
+    java_bin = _java_executable(java_home)
     if not java_bin.exists():
         return None
     try:
@@ -38,6 +108,7 @@ def find_java_home(min_version: int = 21) -> str | None:
       2. macOS: ``/usr/libexec/java_home -v 21+``
       3. Homebrew: ``brew --prefix openjdk@21``
       4. Homebrew: ``brew --prefix openjdk``
+      5. Windows: Adoptium / Oracle / Microsoft / Corretto / Zulu install dirs
     """
     # 1. Existing JAVA_HOME — only if version is sufficient
     env_java = os.environ.get("JAVA_HOME")
@@ -76,21 +147,28 @@ def find_java_home(min_version: int = 21) -> str | None:
                 if jdk_home.is_dir():
                     return str(jdk_home)
                 # Fallback: prefix itself might be JAVA_HOME
-                if (prefix / "bin" / "java").exists():
+                if _java_executable(prefix).exists():
                     return str(prefix)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
+
+    # 5. Windows install locations
+    for candidate in _windows_jdk_candidates():
+        ver = _java_version(candidate)
+        if ver is not None and ver >= min_version:
+            return candidate
 
     return None
 
 
 def find_ghidra_install() -> str | None:
-    """Auto-detect Ghidra installation directory.
+    r"""Auto-detect Ghidra installation directory.
 
     Checks in order:
       1. ``GHIDRA_INSTALL_DIR`` environment variable
       2. Homebrew: ``brew --prefix ghidra`` → ``<prefix>/libexec``
-      3. Common paths: ``/opt/ghidra*``, ``/Applications/ghidra*``
+      3. Common POSIX paths: ``/opt/ghidra*``, ``/Applications/ghidra*``
+      4. Windows: ``%ProgramFiles%\ghidra*``, ``C:\ghidra*``, ``%USERPROFILE%\ghidra*``
 
     Returns the path as a string, or ``None`` if not found.
     """
@@ -115,11 +193,16 @@ def find_ghidra_install() -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # 3. Common paths
+    # 3. Common POSIX paths
     for pattern in ["/opt/ghidra*", "/Applications/ghidra*", "/Applications/Ghidra*"]:
         for candidate in sorted(_glob.glob(pattern), reverse=True):
             p = Path(candidate)
-            if p.is_dir() and (p / "support" / "analyzeHeadless").exists():
+            if p.is_dir() and _is_ghidra_dir(p):
                 return str(p)
+
+    # 4. Windows install locations
+    for candidate in _windows_ghidra_candidates():
+        if _is_ghidra_dir(Path(candidate)):
+            return candidate
 
     return None

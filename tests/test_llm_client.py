@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-from kong.llm.client import AnthropicClient
+import pytest
+
+from kong.llm.client import DEFAULT_MODEL, AnthropicClient
 from kong.llm.usage import ModelTokenUsage, TokenUsage
 
 
@@ -115,7 +117,7 @@ class TestAnthropicClient:
         client.analyze_function("p2", model="claude-haiku-4-5-20251001")
 
         assert len(client.usage.by_model) == 2
-        assert "claude-opus-4-6" in client.usage.by_model
+        assert DEFAULT_MODEL in client.usage.by_model
         assert "claude-haiku-4-5-20251001" in client.usage.by_model
         assert client.usage.calls == 2
 
@@ -308,3 +310,113 @@ class TestProviderAwarePricing:
             assert mu.cost_usd("test-custom-model") == 0.0
         finally:
             PRICING_REGISTRY.pop("test-custom-model", None)
+
+
+class TestCurrentModelPricing:
+    """The registry must cover the models Kong actually defaults to and offers."""
+
+    def test_default_model_is_priced(self):
+        from kong.llm.usage import is_known_model
+
+        assert is_known_model(DEFAULT_MODEL)
+
+    @pytest.mark.parametrize(
+        "model,input_rate,output_rate",
+        [
+            ("claude-fable-5", 10.0, 50.0),
+            ("claude-opus-5", 5.0, 25.0),
+            ("claude-opus-4-8", 5.0, 25.0),
+            ("claude-opus-4-7", 5.0, 25.0),
+            ("claude-opus-4-6", 5.0, 25.0),
+            ("claude-sonnet-5", 2.0, 10.0),
+            ("claude-sonnet-4-6", 3.0, 15.0),
+            ("claude-haiku-4-5", 1.0, 5.0),
+        ],
+    )
+    def test_published_rates(self, model, input_rate, output_rate):
+        from kong.llm.usage import get_pricing
+
+        tier = get_pricing(model)
+        assert tier.input_rate == input_rate
+        assert tier.output_rate == output_rate
+
+    def test_cache_rates_follow_anthropic_multipliers(self):
+        from kong.llm.usage import get_pricing
+
+        tier = get_pricing("claude-opus-5")
+        assert tier.cache_write_rate == tier.input_rate * 1.25
+        assert tier.cache_read_rate == tier.input_rate * 0.10
+
+    def test_unknown_model_is_not_reported_as_known(self):
+        from kong.llm.usage import is_known_model
+
+        assert not is_known_model("claude-not-a-real-model")
+
+    def test_unknown_model_warns_once(self, caplog):
+        import logging
+
+        from kong.llm.usage import _warned_unknown_models, get_pricing
+
+        _warned_unknown_models.discard("some-unlisted-model")
+        try:
+            with caplog.at_level(logging.WARNING, logger="kong.llm.usage"):
+                get_pricing("some-unlisted-model")
+                get_pricing("some-unlisted-model")
+            warnings = [r for r in caplog.records if "some-unlisted-model" in r.message]
+            assert len(warnings) == 1
+        finally:
+            _warned_unknown_models.discard("some-unlisted-model")
+
+
+class TestModelLimits:
+    def test_large_context_models_get_a_larger_prompt_cap(self):
+        from kong.llm.limits import _DEFAULT_LIMITS, get_model_limits
+
+        limits = get_model_limits("claude-opus-5")
+        assert limits.max_prompt_chars > _DEFAULT_LIMITS.max_prompt_chars
+
+    def test_chunk_size_stays_within_the_output_budget(self):
+        """Batch size is bound by output tokens, not by the context window."""
+        from kong.llm.limits import get_model_limits
+
+        limits = get_model_limits("claude-opus-5")
+        assert limits.max_chunk_functions * 130 <= limits.max_output_tokens
+
+    def test_unknown_model_falls_back_to_conservative_limits(self):
+        from kong.llm.limits import _DEFAULT_LIMITS, get_model_limits
+
+        assert get_model_limits("who-knows") == _DEFAULT_LIMITS
+
+class TestAnthropicOutputTokenBudget:
+    def _mock_batch_client(self):
+        mock_anthropic = MagicMock()
+        mock_message = MagicMock()
+        mock_message.content = [
+            MagicMock(type="text", text='[{"name": "f", "confidence": 50}]')
+        ]
+        mock_message.usage = MagicMock(
+            input_tokens=100, output_tokens=50,
+            cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        )
+        mock_anthropic.messages.create.return_value = mock_message
+        return mock_anthropic
+
+    def test_batch_defaults_to_the_full_budget(self):
+        from kong.llm.client import DEFAULT_BATCH_MAX_TOKENS
+
+        mock_anthropic = self._mock_batch_client()
+        client = AnthropicClient(api_key="test")
+        client._client = mock_anthropic
+        client.analyze_function_batch("prompt")
+
+        kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert kwargs["max_tokens"] == DEFAULT_BATCH_MAX_TOKENS
+
+    def test_batch_honours_an_explicit_budget(self):
+        mock_anthropic = self._mock_batch_client()
+        client = AnthropicClient(api_key="test")
+        client._client = mock_anthropic
+        client.analyze_function_batch("prompt", max_tokens=2048)
+
+        kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 2048

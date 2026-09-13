@@ -43,16 +43,19 @@ def print_banner(console: Console) -> None:
 _ENV_VARS: dict[LLMProvider, str] = {
     LLMProvider.ANTHROPIC: "ANTHROPIC_API_KEY",
     LLMProvider.OPENAI: "OPENAI_API_KEY",
+    LLMProvider.ZAI: "ZAI_API_KEY",
 }
 
 _KEY_EXAMPLES: dict[LLMProvider, str] = {
     LLMProvider.ANTHROPIC: "sk-ant-...",
     LLMProvider.OPENAI: "sk-...",
+    LLMProvider.ZAI: "your-zai-key",
 }
 
 _KEY_URLS: dict[LLMProvider, str] = {
     LLMProvider.ANTHROPIC: "https://console.anthropic.com/settings/keys",
     LLMProvider.OPENAI: "https://platform.openai.com/api-keys",
+    LLMProvider.ZAI: "https://z.ai/manage-apikey/apikey-list",
 }
 
 
@@ -85,12 +88,36 @@ def _load_dotenv(provider: LLMProvider) -> None:
                 return
 
 
-def check_api_key(provider: LLMProvider) -> bool:
+def resolve_api_key(
+    provider: LLMProvider, explicit: str | None = None,
+) -> str | None:
+    """The key to authenticate *provider* with, or None if there is none.
+
+    In order: what the caller typed, the environment variable (or a .env next
+    to it), then the key saved in Kong's own config. The environment wins over
+    the saved one so a key exported for a single shell stays a local override.
+    """
+    if explicit:
+        return explicit
+
     env_var = _env_var_for(provider)
-    if env_var is None:
+    if env_var is not None:
+        _load_dotenv(provider)
+        from_env = os.environ.get(env_var)
+        if from_env:
+            return from_env
+
+    # Imported here: kong.db reads the config database, which nothing else in
+    # this module needs, and the banner is imported on every command.
+    from kong.db import get_saved_api_key
+
+    return get_saved_api_key(provider)
+
+
+def check_api_key(provider: LLMProvider) -> bool:
+    if _env_var_for(provider) is None:
         return True
-    _load_dotenv(provider)
-    return bool(os.environ.get(env_var))
+    return bool(resolve_api_key(provider))
 
 
 def print_setup_needed(console: Console, provider: LLMProvider = LLMProvider.ANTHROPIC) -> None:

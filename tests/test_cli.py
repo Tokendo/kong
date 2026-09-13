@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import os
+
+import pytest
 from click.testing import CliRunner
 
 import click
@@ -145,6 +148,55 @@ class TestCreateLLMClient:
             max_retries=5,
         )
 
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_zai_uses_its_own_endpoint_and_key(self, mock_openai_cls, monkeypatch):
+        from kong.config import ZAI_BASE_URL
+        from kong.llm.openai_client import OpenAIClient
+
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-not-this-one")
+
+        client = create_llm_client(
+            LLMConfig(provider=LLMProvider.ZAI, model="glm-5.3")
+        )
+
+        assert isinstance(client, OpenAIClient)
+        mock_openai_cls.assert_called_once_with(
+            api_key="zai-test-key",
+            base_url=ZAI_BASE_URL,
+            max_retries=5,
+        )
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_zai_base_url_can_be_overridden_for_a_coding_plan_key(
+        self, mock_openai_cls, monkeypatch,
+    ):
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+
+        create_llm_client(LLMConfig(
+            provider=LLMProvider.ZAI,
+            model="glm-5.3",
+            base_url="https://api.z.ai/api/coding/paas/v4",
+        ))
+
+        assert mock_openai_cls.call_args.kwargs["base_url"] == (
+            "https://api.z.ai/api/coding/paas/v4"
+        )
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_zai_defaults_to_glm_5_3(self, mock_openai_cls, monkeypatch):
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+
+        client = create_llm_client(LLMConfig(provider=LLMProvider.ZAI))
+
+        assert client.model == "glm-5.3"
+
+    def test_zai_without_a_key_says_which_one_is_missing(self, monkeypatch):
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+
+        with pytest.raises(ValueError, match="ZAI_API_KEY"):
+            create_llm_client(LLMConfig(provider=LLMProvider.ZAI))
+
     @patch("kong.llm.client.anthropic.Anthropic")
     def test_anthropic_returns_anthropic_client(self, mock_anthropic_cls):
         from kong.llm.client import AnthropicClient
@@ -152,6 +204,116 @@ class TestCreateLLMClient:
         config = LLMConfig(provider=LLMProvider.ANTHROPIC, model="claude-opus-4-6")
         client = create_llm_client(config)
         assert isinstance(client, AnthropicClient)
+
+
+class TestGuiCommand:
+    def test_the_scale_flag_reaches_the_window(self, monkeypatch):
+        pytest.importorskip("customtkinter")
+        from kong.gui.app import UI_SCALE_ENV
+
+        monkeypatch.delenv(UI_SCALE_ENV, raising=False)
+        seen = {}
+
+        def fake_launch(initial_binary=""):
+            seen["scale"] = os.environ.get(UI_SCALE_ENV)
+
+        monkeypatch.setattr("kong.gui.app.launch", fake_launch)
+
+        result = CliRunner().invoke(cli, ["gui", "--scale", "1.25"])
+
+        assert result.exit_code == 0
+        assert seen["scale"] == "1.25"
+
+    def test_an_impossible_scale_is_refused(self):
+        result = CliRunner().invoke(cli, ["gui", "--scale", "40"])
+
+        assert result.exit_code != 0
+
+
+class TestApiKeyResolution:
+    """A key can live in the environment or in Kong's own config."""
+
+    def test_the_environment_is_used_when_there_is_nothing_saved(
+        self, tmp_path, monkeypatch,
+    ):
+        from kong.banner import resolve_api_key
+
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        monkeypatch.setenv("ZAI_API_KEY", "from-the-environment")
+
+        assert resolve_api_key(LLMProvider.ZAI) == "from-the-environment"
+
+    def test_a_saved_key_is_used_when_the_environment_has_none(
+        self, tmp_path, monkeypatch,
+    ):
+        from kong.banner import resolve_api_key
+        from kong.db import save_api_key
+
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        save_api_key(LLMProvider.ZAI, "from-the-config")
+
+        assert resolve_api_key(LLMProvider.ZAI) == "from-the-config"
+
+    def test_the_environment_wins_over_a_saved_key(self, tmp_path, monkeypatch):
+        from kong.banner import resolve_api_key
+        from kong.db import save_api_key
+
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        save_api_key(LLMProvider.ZAI, "from-the-config")
+        monkeypatch.setenv("ZAI_API_KEY", "from-the-environment")
+
+        assert resolve_api_key(LLMProvider.ZAI) == "from-the-environment"
+
+    def test_an_explicit_key_wins_over_both(self, tmp_path, monkeypatch):
+        from kong.banner import resolve_api_key
+        from kong.db import save_api_key
+
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        save_api_key(LLMProvider.ZAI, "from-the-config")
+        monkeypatch.setenv("ZAI_API_KEY", "from-the-environment")
+
+        assert resolve_api_key(LLMProvider.ZAI, "typed-in") == "typed-in"
+
+    def test_a_saved_key_counts_as_configured(self, tmp_path, monkeypatch):
+        from kong.banner import check_api_key
+        from kong.db import save_api_key
+
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        save_api_key(LLMProvider.ANTHROPIC, "sk-ant-saved")
+
+        assert check_api_key(LLMProvider.ANTHROPIC)
+
+    @patch("kong.llm.client.anthropic.Anthropic")
+    def test_a_key_saved_in_the_gui_reaches_the_anthropic_client(
+        self, mock_anthropic_cls, tmp_path, monkeypatch,
+    ):
+        from kong.db import save_api_key
+
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        save_api_key(LLMProvider.ANTHROPIC, "sk-ant-saved")
+
+        create_llm_client(
+            LLMConfig(provider=LLMProvider.ANTHROPIC, model="claude-opus-5")
+        )
+
+        assert mock_anthropic_cls.call_args.kwargs["api_key"] == "sk-ant-saved"
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_a_key_saved_in_the_gui_reaches_zai(
+        self, mock_openai_cls, tmp_path, monkeypatch,
+    ):
+        from kong.db import save_api_key
+
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        save_api_key(LLMProvider.ZAI, "zai-saved")
+
+        create_llm_client(LLMConfig(provider=LLMProvider.ZAI))
+
+        assert mock_openai_cls.call_args.kwargs["api_key"] == "zai-saved"
 
 
 class TestResolveProviderCustom:
@@ -249,3 +411,353 @@ class TestCustomProviderIntegration:
         ])
 
         assert "not installed" in result.output.lower() or "not found" in result.output.lower()
+
+
+def _fake_endpoint(monkeypatch, models_payload, props_payload=None):
+    """Serve canned llama.cpp payloads to the endpoint discovery code."""
+    import io
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    class _Body(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        url = request.full_url
+        if url.endswith("/models"):
+            return _Body(_json.dumps(models_payload).encode())
+        if url.endswith("/props") and props_payload is not None:
+            return _Body(_json.dumps(props_payload).encode())
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+
+_LLAMA_MODELS = {
+    "data": [
+        {
+            "id": "qwen2.5-coder-7b",
+            "meta": {"n_ctx_train": 32768, "n_params": 7_615_616_512},
+        }
+    ]
+}
+_LLAMA_PROPS = {
+    "default_generation_settings": {"n_ctx": 16384},
+    "total_slots": 1,
+    "build_info": "b4321",
+}
+
+
+def test_models_lists_what_the_endpoint_serves(tmp_path, monkeypatch):
+    monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+    _fake_endpoint(monkeypatch, _LLAMA_MODELS, _LLAMA_PROPS)
+
+    result = CliRunner().invoke(
+        cli, ["models", "--base-url", "http://127.0.0.1:8080/v1"]
+    )
+
+    assert result.exit_code == 0
+    assert "qwen2.5-coder-7b" in result.output
+    assert "7.6B" in result.output
+    assert "16,384" in result.output  # runtime context, not the trained 32768
+
+
+def test_models_suggests_limits_sized_for_the_window(tmp_path, monkeypatch):
+    monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+    _fake_endpoint(monkeypatch, _LLAMA_MODELS, _LLAMA_PROPS)
+
+    result = CliRunner().invoke(
+        cli, ["models", "--base-url", "http://127.0.0.1:8080/v1"]
+    )
+
+    assert "--max-output-tokens   2048" in result.output
+    assert "--max-chunk-functions 7" in result.output
+    assert "--max-prompt-chars    41208" in result.output
+
+
+def test_models_warns_when_the_window_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+    _fake_endpoint(monkeypatch, {"data": [{"id": "some-model"}]})
+
+    result = CliRunner().invoke(
+        cli, ["models", "--base-url", "http://127.0.0.1:8080/v1"]
+    )
+
+    assert result.exit_code == 0
+    assert "does not report its context window" in result.output
+
+
+def test_models_reports_an_unreachable_endpoint(tmp_path, monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        MagicMock(side_effect=urllib.error.URLError("connection refused")),
+    )
+
+    result = CliRunner().invoke(
+        cli, ["models", "--base-url", "http://127.0.0.1:9999/v1"]
+    )
+
+    assert result.exit_code == 1
+    assert "Could not reach" in result.output
+
+
+def test_models_needs_an_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["models"])
+
+    assert result.exit_code == 1
+    assert "No endpoint configured" in result.output
+
+
+class TestZaiProvider:
+    """Z.ai is a hosted provider, not a hand-configured custom endpoint."""
+
+    def test_the_model_limits_are_the_ones_of_a_1m_context(self):
+        from kong.llm.limits import get_model_limits
+
+        assert get_model_limits("glm-5.3").max_prompt_chars == 900_000
+        assert get_model_limits("glm-5.3-flash").max_prompt_chars == 900_000
+
+    def test_the_batch_leaves_room_for_the_reasoning_in_front_of_the_answer(self):
+        """GLM charges its thinking to the budget the JSON has to fit in too."""
+        from kong.llm.limits import get_model_limits
+
+        for model in ("glm-5.3", "glm-5.3-flash"):
+            limits = get_model_limits(model)
+            # ~130 output tokens of JSON per function, so the answer alone must
+            # not come close to the budget: at 120/16k it was 95% of it, and
+            # every chunk truncated before the model reached the answer.
+            answer_tokens = limits.max_chunk_functions * 130
+            assert answer_tokens < limits.max_output_tokens // 3
+
+    def test_it_does_not_share_the_anthropic_numbers(self):
+        """Same context window, different behaviour in the completion budget."""
+        from kong.llm.limits import get_model_limits
+
+        glm = get_model_limits("glm-5.3")
+        claude = get_model_limits("claude-opus-5")
+
+        assert glm.max_prompt_chars == claude.max_prompt_chars
+        assert glm.max_chunk_functions < claude.max_chunk_functions
+        assert glm.max_output_tokens > claude.max_output_tokens
+
+    def test_glm_5_3_has_published_pricing(self):
+        from kong.llm.usage import is_known_model
+
+        assert is_known_model("glm-5.3")
+
+    def test_a_missing_model_listing_is_not_a_dead_endpoint(self, monkeypatch):
+        """Z.ai documents chat/completions, not /models."""
+        import httpx
+        import openai
+
+        from kong.llm.probe import probe_endpoint
+
+        def not_found(self):
+            raise openai.NotFoundError(
+                "no such endpoint",
+                response=httpx.Response(
+                    404, request=httpx.Request("GET", "https://api.z.ai/models")
+                ),
+                body=None,
+            )
+
+        monkeypatch.setattr(openai.resources.models.Models, "list", not_found)
+
+        assert probe_endpoint(
+            LLMConfig(provider=LLMProvider.ZAI, api_key="zai-test-key")
+        )
+
+    def test_a_run_without_a_key_does_not_start(self, monkeypatch):
+        from kong.llm.probe import probe_endpoint
+
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+
+        assert not probe_endpoint(LLMConfig(provider=LLMProvider.ZAI))
+
+    def test_the_provider_reaches_the_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KONG_CONFIG_DIR", str(tmp_path))
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        save_setup(enabled=[LLMProvider.ZAI], default=LLMProvider.ZAI)
+
+        captured = {}
+
+        def fake_probe(llm_config):
+            captured["llm"] = llm_config
+            return True
+
+        monkeypatch.setattr("kong.llm.probe.probe_endpoint", fake_probe)
+        monkeypatch.setattr("kong.config.find_ghidra_install", lambda: None)
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF")
+
+        CliRunner().invoke(cli, [
+            "analyze", str(binary), "--provider", "zai",
+            "--model", "glm-5.3", "--headless",
+        ])
+
+        assert captured["llm"].provider is LLMProvider.ZAI
+        assert captured["llm"].model == "glm-5.3"
+
+
+class TestTwoPassFlags:
+    """The draft flags have to survive the trip from argv into LLMConfig."""
+
+    def _run(self, tmp_path, monkeypatch, *flags):
+        _complete_setup(tmp_path, monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test1234")
+
+        captured = {}
+
+        def fake_probe(llm_config):
+            captured["llm"] = llm_config
+            return True
+
+        monkeypatch.setattr("kong.llm.probe.probe_endpoint", fake_probe)
+        monkeypatch.setattr("kong.config.find_ghidra_install", lambda: None)
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF")
+
+        CliRunner().invoke(cli, ["analyze", str(binary), "--headless", *flags])
+        return captured["llm"]
+
+    def test_the_draft_model_reaches_the_config(self, tmp_path, monkeypatch):
+        llm = self._run(
+            tmp_path, monkeypatch,
+            "--model", "claude-opus-5",
+            "--draft-model", "claude-haiku-4-5",
+        )
+
+        assert llm.draft_model == "claude-haiku-4-5"
+        assert llm.model == "claude-opus-5"
+
+    def test_the_threshold_reaches_the_config(self, tmp_path, monkeypatch):
+        llm = self._run(
+            tmp_path, monkeypatch,
+            "--draft-model", "claude-haiku-4-5",
+            "--refine-below", "60",
+        )
+
+        assert llm.refine_below == 60
+
+    def test_the_threshold_defaults_to_the_high_confidence_bar(
+        self, tmp_path, monkeypatch,
+    ):
+        from kong.agent.refinement import DEFAULT_REFINE_BELOW
+
+        llm = self._run(tmp_path, monkeypatch, "--draft-model", "claude-haiku-4-5")
+
+        assert llm.refine_below == DEFAULT_REFINE_BELOW
+
+    def test_a_single_pass_run_carries_no_draft_model(self, tmp_path, monkeypatch):
+        llm = self._run(tmp_path, monkeypatch, "--model", "claude-opus-5")
+
+        assert llm.draft_model is None
+
+    def test_a_threshold_outside_the_scale_is_refused(self, tmp_path, monkeypatch):
+        _complete_setup(tmp_path, monkeypatch)
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF")
+
+        result = CliRunner().invoke(cli, [
+            "analyze", str(binary), "--refine-below", "150", "--headless",
+        ])
+
+        assert result.exit_code != 0
+
+    def test_a_batch_size_reaches_the_config_on_a_hosted_provider(
+        self, tmp_path, monkeypatch,
+    ):
+        """Not custom-only any more: a hosted endpoint can be told to go slower."""
+        llm = self._run(tmp_path, monkeypatch, "--max-chunk-functions", "20")
+
+        assert llm.provider is LLMProvider.ANTHROPIC
+        assert llm.max_chunk_functions == 20
+
+
+class TestStageFlag:
+    """--stage splits the draft from the pass that finishes it."""
+
+    def _invoke(self, tmp_path, monkeypatch, *flags):
+        _complete_setup(tmp_path, monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test1234")
+        monkeypatch.setattr("kong.llm.probe.probe_endpoint", lambda config: True)
+        monkeypatch.setattr("kong.config.find_ghidra_install", lambda: None)
+
+        binary = tmp_path / "target.bin"
+        binary.write_bytes(b"\x7fELF")
+        return CliRunner().invoke(
+            cli, ["analyze", str(binary), "--headless", *flags]
+        )
+
+    def test_a_draft_run_says_what_it_will_not_do(self, tmp_path, monkeypatch):
+        result = self._invoke(
+            tmp_path, monkeypatch,
+            "--stage", "draft",
+            "--model", "claude-opus-5",
+            "--draft-model", "claude-haiku-4-5",
+        )
+
+        assert "Draft stage" in result.output
+        assert "--stage finish" in result.output
+
+    def test_a_draft_run_without_a_draft_model_is_allowed_and_explained(
+        self, tmp_path, monkeypatch,
+    ):
+        result = self._invoke(tmp_path, monkeypatch, "--stage", "draft")
+
+        assert "--stage draft without --draft-model" in result.output
+
+    def test_a_finish_run_says_where_it_reads_the_draft_from(
+        self, tmp_path, monkeypatch,
+    ):
+        from kong.state.persistence import state_path
+
+        out = tmp_path / "out"
+        out.mkdir()
+        state_path(out).write_text("{}", encoding="utf-8")
+
+        result = self._invoke(
+            tmp_path, monkeypatch, "--stage", "finish", "--output", str(out),
+        )
+
+        assert "Finishing pass" in result.output
+
+    def test_finishing_without_a_draft_names_the_directory_it_looked_in(
+        self, tmp_path, monkeypatch,
+    ):
+        """Checked before Ghidra opens the binary, not a minute later."""
+        result = self._invoke(
+            tmp_path, monkeypatch,
+            "--stage", "finish", "--output", str(tmp_path / "nowhere"),
+        )
+
+        assert result.exit_code != 0
+        assert "No saved analysis" in result.output
+
+    def test_finishing_a_draft_that_fresh_would_delete_is_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        result = self._invoke(tmp_path, monkeypatch, "--stage", "finish", "--fresh")
+
+        assert result.exit_code != 0
+        assert "throws away" in result.output
+
+    def test_an_unknown_stage_is_refused(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, "--stage", "halfway")
+
+        assert result.exit_code != 0

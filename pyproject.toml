@@ -30,6 +30,7 @@ dependencies = [
     "pyghidra>=2.2.1",
     "jpype1>=1.6.0",
     "json-repair>=0.58.5",
+    "customtkinter>=5.2",
 ]
 
 [project.urls]

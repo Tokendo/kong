@@ -18,6 +18,7 @@ from kong.agent.models import FunctionResult
 from kong.agent.queue import WorkItem
 from kong.ghidra.client import GhidraClient
 from kong.ghidra.types import BinaryInfo, FunctionInfo, StringEntry, StructDefinition
+from kong.llm.limits import take_within_budget
 from kong.normalizer.syntactic import normalize
 from kong.agent.deobfuscator import classify_obfuscation
 
@@ -42,6 +43,42 @@ def _safe_int(value: object, default: int = 0) -> int:
         return int(s, 16)
     except (ValueError, TypeError):
         return default
+
+
+def _confidence(value: object, default: int = 0) -> int:
+    """Coerce a self-reported confidence score to an int in 0-100.
+
+    The schema asks for an integer, but models return "85", "85%" or 0.85
+    often enough that taking the value at face value crashes the run: the
+    score is compared against thresholds in AnalysisStats.record_result, and
+    a str there raises TypeError after the LLM work has already been paid
+    for.
+
+    A value strictly between 0 and 1 cannot be a valid score on a 0-100
+    scale, so it is read as a fraction rather than discarded. 0 and 1 stay
+    as they are, being plausible integer scores.
+    """
+    if isinstance(value, bool):
+        return default
+
+    number: float
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip().rstrip("%").strip()
+        try:
+            number = float(text)
+        except ValueError:
+            logger.debug("Unusable confidence %r, recording %d", value, default)
+            return default
+    else:
+        logger.debug("Unusable confidence %r, recording %d", value, default)
+        return default
+
+    if 0 < number < 1:
+        number *= 100
+
+    return max(0, min(100, round(number)))
 
 
 def strip_markdown_fences(text: str) -> str:
@@ -78,7 +115,13 @@ class LLMClient(Protocol):
         max_rounds: int = 10,
     ) -> LLMResponse: ...
 
-    def analyze_function_batch(self, prompt: str, *, model: str | None = None) -> list[LLMResponse]: ...
+    def analyze_function_batch(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        max_tokens: int | None = None,
+    ) -> list[LLMResponse]: ...
 
 
 @dataclass
@@ -143,6 +186,27 @@ class AnalysisContext:
     known_types: list[StructDefinition] = field(default_factory=list)
 
 
+def _render_snippet(cs: FunctionSnippet) -> str:
+    """Render a caller/callee snippet the way the prompt shows it."""
+    return f"#### {cs.name} (0x{cs.address:08x})\n```c\n{cs.snippet}\n```"
+
+
+def _rendered_len(snippets: list[FunctionSnippet]) -> int:
+    return sum(len(_render_snippet(cs)) + 1 for cs in snippets)
+
+
+def _render_struct(sd: StructDefinition) -> str:
+    """Render a recovered struct the way the prompt shows it."""
+    lines = [f"\n```c\nstruct {sd.name} {{ // {sd.size} bytes"]
+    lines += [
+        f"    {f.data_type} {f.name}; // offset 0x{f.offset:x}, {f.size} bytes"
+        for f in sd.fields
+    ]
+    lines.append("};")
+    lines.append("```")
+    return "\n".join(lines)
+
+
 class Analyzer:
     """Analyzes a single function: gather context -> LLM -> parse -> write back.
 
@@ -157,10 +221,18 @@ class Analyzer:
         client: GhidraClient,
         llm_client: LLMClient,
         deobfuscator: Deobfuscator | None = None,
+        max_prompt_chars: int | None = None,
     ) -> None:
         self.client = client
         self.llm = llm_client
         self._deobfuscator = deobfuscator
+        self.max_prompt_chars = max_prompt_chars
+
+    def _section_budget(self) -> int | None:
+        """Char budget for one context section that grows with the binary."""
+        if self.max_prompt_chars is None:
+            return None
+        return max(0, self.max_prompt_chars // 10)
 
     def analyze(
         self,
@@ -175,6 +247,25 @@ class Analyzer:
 
         func = item.function
         context = self._build_context(item, binary_info, known_results, strings, known_types)
+
+        # Every growing section is capped at a tenth of the budget, and there
+        # are four of them, so this is what is genuinely left for the body.
+        allowance = (
+            self.max_prompt_chars - 4 * (self._section_budget() or 0)
+            if self.max_prompt_chars is not None
+            else None
+        )
+        if allowance is not None and len(context.decompilation) > allowance:
+            return FunctionResult(
+                address=func.address,
+                original_name=func.name,
+                error=(
+                    f"Decompilation is {len(context.decompilation)} chars, over the "
+                    f"{allowance} chars left by the {self.max_prompt_chars} char "
+                    f"prompt budget; raise --max-prompt-chars or use a model with "
+                    f"a larger context."
+                ),
+            )
 
         techniques = classify_obfuscation(context.decompilation) if self._deobfuscator else []
 
@@ -223,11 +314,36 @@ class Analyzer:
 
         func_strings = self._get_referenced_strings(func.address, strings)
 
-        known_map = {
-            addr: r.name
+        budget = self._section_budget()
+        if budget is not None:
+            callee_snippets = take_within_budget(
+                callee_snippets, _render_snippet, budget
+            )
+            caller_snippets = take_within_budget(
+                caller_snippets, _render_snippet, budget - _rendered_len(callee_snippets)
+            )
+            func_strings = take_within_budget(
+                func_strings, lambda s: f'- "{s}"', budget
+            )
+
+        known_pairs = [
+            (addr, r.name)
             for addr, r in known_results.items()
             if r.name and not r.skipped and not r.error
-        }
+        ]
+        types = list(known_types or [])
+
+        if budget is not None:
+            # Newest first: analysis runs bottom-up, so the most recent names
+            # are the nearest callees of the function being analyzed.
+            known_pairs = take_within_budget(
+                reversed(known_pairs),
+                lambda pair: f"- 0x{pair[0]:08x}: {pair[1]}",
+                budget,
+            )
+            types = take_within_budget(types, _render_struct, budget)
+
+        known_map = dict(known_pairs)
 
         return AnalysisContext(
             function=func,
@@ -237,7 +353,7 @@ class Analyzer:
             callee_snippets=callee_snippets,
             referenced_strings=func_strings,
             known_functions=known_map,
-            known_types=known_types or [],
+            known_types=types,
         )
 
     def _get_snippets(
@@ -339,11 +455,7 @@ class Analyzer:
                 "Use them in your signature if the function's parameters match."
             )
             for sd in context.known_types:
-                parts.append(f"\n```c\nstruct {sd.name} {{ // {sd.size} bytes")
-                for f in sd.fields:
-                    parts.append(f"    {f.data_type} {f.name}; // offset 0x{f.offset:x}, {f.size} bytes")
-                parts.append("};")
-                parts.append("```")
+                parts.append(_render_struct(sd))
 
         return "\n".join(parts)
 
@@ -484,7 +596,7 @@ class Analyzer:
         return LLMResponse(
             name=data.get("name", ""),
             signature=data.get("signature", ""),
-            confidence=data.get("confidence", 0),
+            confidence=_confidence(data.get("confidence", 0)),
             classification=data.get("classification", ""),
             comments=data.get("comments", ""),
             reasoning=data.get("reasoning", ""),
@@ -504,7 +616,10 @@ class Analyzer:
                 data = json_repair.loads(text)
                 logger.debug("Recovered malformed batch JSON via json_repair")
             except Exception:
-                logger.warning("Failed to parse batch LLM response: %s", raw[:200])
+                logger.warning(
+                    "Failed to parse batch LLM response (%d chars): %s",
+                    len(raw), raw[:2000],
+                )
                 return []
 
         if not isinstance(data, list):
@@ -515,7 +630,7 @@ class Analyzer:
             LLMResponse(
                 name=entry.get("name", ""),
                 signature=entry.get("signature", ""),
-                confidence=entry.get("confidence", 0),
+                confidence=_confidence(entry.get("confidence", 0)),
                 classification=entry.get("classification", ""),
                 comments=entry.get("comments", ""),
                 reasoning=entry.get("reasoning", ""),

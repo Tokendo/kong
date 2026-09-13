@@ -13,6 +13,7 @@ class Phase(Enum):
     ANALYSIS = "analysis"
     CLEANUP = "cleanup"
     SYNTHESIS = "synthesis"
+    COHERENCE = "coherence"
     EXPORT = "export"
 
 
@@ -39,6 +40,10 @@ class EventType(Enum):
     SYNTHESIS_GLOBALS_UNIFIED = "synthesis_globals_unified"
     SYNTHESIS_STRUCTS_SYNTHESIZED = "synthesis_structs_synthesized"
     SYNTHESIS_NAMES_REFINED = "synthesis_names_refined"
+
+    COHERENCE_CHECKED = "coherence_checked"
+    COHERENCE_CONFLICT = "coherence_conflict"
+    COHERENCE_RESOLVED = "coherence_resolved"
 
     DEOBFUSCATION_DETECTED = "deobfuscation_detected"
     DEOBFUSCATION_TOOL_CALL = "deobfuscation_tool_call"

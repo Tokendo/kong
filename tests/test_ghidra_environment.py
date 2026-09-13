@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from kong.ghidra.environment import (
+    _is_ghidra_dir,
+    _java_executable,
     _java_version,
+    _windows_ghidra_candidates,
+    _windows_jdk_candidates,
     find_ghidra_install,
     find_java_home,
 )
@@ -124,3 +128,96 @@ class TestFindJavaHome:
         with patch.dict(os.environ, {}, clear=True):
             with patch("subprocess.run", side_effect=FileNotFoundError):
                 assert find_java_home() is None
+
+
+class TestWindowsDiscovery:
+    """Ghidra ships a .bat launcher on Windows and installs outside /opt."""
+
+    def test_java_executable_name_posix(self, tmp_path):
+        with patch("kong.ghidra.environment._IS_WINDOWS", False):
+            assert _java_executable(tmp_path).name == "java"
+
+    def test_java_executable_name_windows(self, tmp_path):
+        with patch("kong.ghidra.environment._IS_WINDOWS", True):
+            assert _java_executable(tmp_path).name == "java.exe"
+
+    def test_ghidra_dir_accepts_bat_launcher(self, tmp_path):
+        ghidra = tmp_path / "ghidra_11.3_PUBLIC"
+        (ghidra / "support").mkdir(parents=True)
+        (ghidra / "support" / "analyzeHeadless.bat").touch()
+        assert _is_ghidra_dir(ghidra)
+
+    def test_ghidra_dir_accepts_posix_launcher(self, tmp_path):
+        ghidra = tmp_path / "ghidra_11.3_PUBLIC"
+        (ghidra / "support").mkdir(parents=True)
+        (ghidra / "support" / "analyzeHeadless").touch()
+        assert _is_ghidra_dir(ghidra)
+
+    def test_ghidra_dir_rejects_unrelated_dir(self, tmp_path):
+        assert not _is_ghidra_dir(tmp_path)
+
+    def test_candidates_empty_off_windows(self):
+        with patch("kong.ghidra.environment._IS_WINDOWS", False):
+            assert _windows_jdk_candidates() == []
+            assert _windows_ghidra_candidates() == []
+
+    def test_jdk_candidates_scan_program_files(self, tmp_path):
+        jdk = tmp_path / "Eclipse Adoptium" / "jdk-21.0.5+11"
+        jdk.mkdir(parents=True)
+        with patch("kong.ghidra.environment._IS_WINDOWS", True):
+            with patch(
+                "kong.ghidra.environment._windows_program_dirs",
+                return_value=[str(tmp_path)],
+            ):
+                assert str(jdk) in _windows_jdk_candidates()
+
+    def test_ghidra_candidates_scan_program_files(self, tmp_path):
+        ghidra = tmp_path / "ghidra_11.3_PUBLIC"
+        ghidra.mkdir(parents=True)
+        with patch("kong.ghidra.environment._IS_WINDOWS", True):
+            with patch(
+                "kong.ghidra.environment._windows_program_dirs",
+                return_value=[str(tmp_path)],
+            ):
+                assert str(ghidra) in _windows_ghidra_candidates()
+
+    def test_find_ghidra_install_uses_windows_candidates(self, tmp_path):
+        ghidra = tmp_path / "ghidra_11.3_PUBLIC"
+        (ghidra / "support").mkdir(parents=True)
+        (ghidra / "support" / "analyzeHeadless.bat").touch()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("subprocess.run", side_effect=FileNotFoundError):
+                with patch("glob.glob", return_value=[]):
+                    with patch(
+                        "kong.ghidra.environment._windows_ghidra_candidates",
+                        return_value=[str(ghidra)],
+                    ):
+                        assert find_ghidra_install() == str(ghidra)
+
+    def test_find_java_home_uses_windows_candidates(self, tmp_path):
+        jdk = tmp_path / "jdk-21.0.5+11"
+        (jdk / "bin").mkdir(parents=True)
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("subprocess.run", side_effect=FileNotFoundError):
+                with patch(
+                    "kong.ghidra.environment._windows_jdk_candidates",
+                    return_value=[str(jdk)],
+                ):
+                    with patch(
+                        "kong.ghidra.environment._java_version", return_value=21
+                    ):
+                        assert find_java_home() == str(jdk)
+
+    def test_find_java_home_skips_windows_candidate_below_min_version(self, tmp_path):
+        jdk = tmp_path / "jdk-17"
+        (jdk / "bin").mkdir(parents=True)
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("subprocess.run", side_effect=FileNotFoundError):
+                with patch(
+                    "kong.ghidra.environment._windows_jdk_candidates",
+                    return_value=[str(jdk)],
+                ):
+                    with patch(
+                        "kong.ghidra.environment._java_version", return_value=17
+                    ):
+                        assert find_java_home() is None

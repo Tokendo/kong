@@ -53,6 +53,18 @@ def _build_function_entry(result: FunctionResult) -> dict[str, str | int | list[
         "comments": result.comments,
         "reasoning": result.reasoning,
         "obfuscation_techniques": result.obfuscation_techniques,
+        # Which model gets the credit, and whether a second pass looked at it.
+        # On a two-model run this is what tells the two apart afterwards.
+        "model": result.model,
+        "refined": result.refined,
+    }
+
+
+def _build_failure_entry(result: FunctionResult) -> dict[str, str]:
+    return {
+        "address": f"0x{result.address:08x}",
+        "original_name": result.original_name,
+        "error": result.error,
     }
 
 
@@ -63,10 +75,18 @@ def export_json(data: ExportData, output_path: Path) -> Path:
     ]
     includable.sort(key=lambda r: r.address)
 
+    # Listed separately rather than dropped: stats.errors counts them, and
+    # without this the only record of why is events.log.
+    failures = sorted(
+        (r for r in data.results.values() if r.error),
+        key=lambda r: r.address,
+    )
+
     document = {
         "binary": _build_binary_section(data),
         "stats": _build_stats_section(data),
         "functions": [_build_function_entry(r) for r in includable],
+        "failures": [_build_failure_entry(r) for r in failures],
     }
 
     output_path.write_text(json.dumps(document, indent=2))

@@ -67,6 +67,24 @@ class TestStructAccumulator:
         acc.add_proposals(0x1000, [p])
         assert acc._proposals[0].source_function == 0x1000
 
+    def test_drop_proposals_forgets_one_function(self):
+        acc = StructAccumulator()
+        acc.add_proposals(0x1000, [_proposal("conn_t", 32, [_field("fd", "int", 0, 4)])])
+        acc.add_proposals(0x2000, [_proposal("conn_t", 32, [_field("fd", "int", 0, 4)])])
+
+        dropped = acc.drop_proposals(0x1000)
+
+        assert dropped == 1
+        assert acc.proposal_count == 1
+        assert acc._proposals[0].source_function == 0x2000
+
+    def test_drop_proposals_for_a_function_that_proposed_nothing(self):
+        acc = StructAccumulator()
+        acc.add_proposals(0x1000, [_proposal("conn_t", 32, [_field("fd", "int", 0, 4)])])
+
+        assert acc.drop_proposals(0x9000) == 0
+        assert acc.proposal_count == 1
+
     def test_single_proposal_unifies_to_one(self):
         acc = StructAccumulator()
         acc.add_proposals(0x1000, [

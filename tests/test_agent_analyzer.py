@@ -431,3 +431,91 @@ class TestParseLlmJsonRepair:
         raw = '{"name": "process_data", "confidence": 70, "classification": "par'
         result = Analyzer.parse_llm_json(raw)
         assert result.name == "process_data"
+
+
+class TestConfidenceCoercion:
+    """A self-reported score has to survive whatever shape the model sends.
+
+    AnalysisStats.record_result compares it against thresholds, so a str
+    there raises TypeError and kills the run after the LLM work is paid for.
+    """
+
+    @staticmethod
+    def _parse(value):
+        return Analyzer.parse_llm_json(
+            json.dumps({"name": "f", "confidence": value})
+        ).confidence
+
+    def test_a_plain_int_is_unchanged(self):
+        assert self._parse(85) == 85
+
+    def test_a_numeric_string_is_converted(self):
+        assert self._parse("85") == 85
+
+    def test_a_percent_sign_is_stripped(self):
+        assert self._parse("85%") == 85
+
+    def test_surrounding_whitespace_is_ignored(self):
+        assert self._parse("  92 % ") == 92
+
+    def test_a_fraction_is_read_as_a_percentage(self):
+        """0.85 cannot be a valid score on a 0-100 scale, so it is a fraction."""
+        assert self._parse(0.85) == 85
+
+    def test_a_fraction_as_a_string_is_read_the_same_way(self):
+        assert self._parse("0.9") == 90
+
+    def test_zero_and_one_stay_as_integers(self):
+        assert self._parse(0) == 0
+        assert self._parse(1) == 1
+
+    def test_floats_are_rounded(self):
+        assert self._parse(85.4) == 85
+        assert self._parse(85.6) == 86
+
+    def test_out_of_range_values_are_clamped(self):
+        assert self._parse(150) == 100
+        assert self._parse(-5) == 0
+
+    def test_unusable_values_record_zero(self):
+        assert self._parse("high") == 0
+        assert self._parse(None) == 0
+        assert self._parse({"score": 90}) == 0
+
+    def test_a_boolean_is_not_a_score(self):
+        assert self._parse(True) == 0
+
+    def test_a_missing_field_records_zero(self):
+        assert Analyzer.parse_llm_json('{"name": "f"}').confidence == 0
+
+    def test_the_result_is_always_an_int(self):
+        for value in ("85", 0.85, 85.6, "150", None):
+            assert isinstance(self._parse(value), int)
+
+    def test_batch_entries_are_coerced_too(self):
+        raw = json.dumps([
+            {"address": "0x1000", "name": "a", "confidence": "85"},
+            {"address": "0x2000", "name": "b", "confidence": 0.7},
+        ])
+
+        responses = Analyzer.parse_llm_json_batch(raw)
+
+        assert [r.confidence for r in responses] == [85, 70]
+
+    def test_a_coerced_score_reaches_the_right_bucket(self):
+        from kong.agent.models import AnalysisStats, FunctionResult
+
+        response = Analyzer.parse_llm_json(
+            json.dumps({"name": "f", "confidence": "85"})
+        )
+        stats = AnalysisStats()
+        stats.record_result(
+            FunctionResult(
+                address=0x1000,
+                original_name="FUN_00001000",
+                name=response.name,
+                confidence=response.confidence,
+            )
+        )
+
+        assert stats.high_confidence == 1

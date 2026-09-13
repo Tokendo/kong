@@ -15,11 +15,31 @@ import anthropic
 from kong.agent.analyzer import Analyzer, LLMResponse
 from kong.agent.prompts import BATCH_OUTPUT_SCHEMA, BATCH_SYSTEM_PROMPT, OUTPUT_SCHEMA, SYSTEM_PROMPT
 from kong.llm.tools import ToolExecutor
+from kong.llm.truncation import call_with_budget
 from kong.llm.usage import TokenUsage
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-4-6"
+DEFAULT_MODEL = "claude-opus-5"
+
+# Output budget for a batch call when the caller does not set one.
+DEFAULT_BATCH_MAX_TOKENS = 16384
+
+
+def _extract_text(message: Any) -> str:
+    return "".join(block.text for block in message.content if block.type == "text")
+
+
+def _answered_nothing(message: Any) -> bool:
+    """True when the output budget ran out before the model said anything.
+
+    Thinking tokens are charged to the same budget as the answer, so this
+    arrives as a successful message with no text in it. A tool call counts as
+    an answer: a turn that only calls a tool is not truncated.
+    """
+    if _extract_text(message) or message.stop_reason == "tool_use":
+        return False
+    return message.stop_reason == "max_tokens"
 
 
 class AnthropicClient:
@@ -48,50 +68,75 @@ class AnthropicClient:
     def analyze_function(self, prompt: str, *, model: str | None = None) -> LLMResponse:
         """Send an analysis prompt and return parsed response (no tools)."""
         effective_model = model or self.model
-        message = self._client.messages.create(
-            model=effective_model,
-            max_tokens=self.max_tokens,
-            system=[{
-                "type": "text",
-                "text": f"{SYSTEM_PROMPT}\n\n{OUTPUT_SCHEMA}",
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
+
+        def send(budget: int) -> Any:
+            message = self._client.messages.create(
+                model=effective_model,
+                max_tokens=budget,
+                system=[{
+                    "type": "text",
+                    "text": f"{SYSTEM_PROMPT}\n\n{OUTPUT_SCHEMA}",
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+            )
+            self._record_usage(message, effective_model)
+            return message
+
+        message = call_with_budget(
+            send,
+            budget=self.max_tokens,
+            is_truncated=_answered_nothing,
+            label=f"{effective_model} function analysis",
         )
 
         raw_text = self._extract_text(message)
-        self._record_usage(message, effective_model)
-
         response = Analyzer.parse_llm_json(raw_text)
         response.input_tokens = message.usage.input_tokens
         response.output_tokens = message.usage.output_tokens
         response.raw = raw_text
         return response
 
-    def analyze_function_batch(self, prompt: str, *, model: str | None = None) -> list[LLMResponse]:
+    def analyze_function_batch(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        max_tokens: int | None = None,
+    ) -> list[LLMResponse]:
         """Send a batch analysis prompt and return parsed list of responses."""
         effective_model = model or self.model
-        message = self._client.messages.create(
-            model=effective_model,
-            max_tokens=16384,
-            system=[{
-                "type": "text",
-                "text": f"{BATCH_SYSTEM_PROMPT}\n\n{BATCH_OUTPUT_SCHEMA}",
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[
-                {"role": "user", "content": prompt},
-            ],
+
+        def send(budget: int) -> Any:
+            message = self._client.messages.create(
+                model=effective_model,
+                max_tokens=budget,
+                system=[{
+                    "type": "text",
+                    "text": f"{BATCH_SYSTEM_PROMPT}\n\n{BATCH_OUTPUT_SCHEMA}",
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            self._record_usage(message, effective_model)
+            return message
+
+        # A truncated batch costs every function in the chunk, not one.
+        message = call_with_budget(
+            send,
+            budget=max_tokens or DEFAULT_BATCH_MAX_TOKENS,
+            is_truncated=_answered_nothing,
+            label=f"{effective_model} chunk analysis",
         )
 
         raw_text = self._extract_text(message)
-        self._record_usage(message, effective_model)
-
         responses = Analyzer.parse_llm_json_batch(raw_text)
         for resp in responses:
             resp.input_tokens = message.usage.input_tokens
@@ -126,18 +171,27 @@ class AnthropicClient:
         total_input = 0
         total_output = 0
 
-        for _ in range(max_rounds):
+        def send(budget: int) -> Any:
+            nonlocal total_input, total_output
             message = self._client.messages.create(
                 model=self.model,
-                max_tokens=self.max_tokens,
+                max_tokens=budget,
                 system=cached_system,
                 tools=tools,
                 messages=messages,
             )
-
             total_input += message.usage.input_tokens
             total_output += message.usage.output_tokens
             self._record_usage(message, self.model)
+            return message
+
+        for _ in range(max_rounds):
+            message = call_with_budget(
+                send,
+                budget=self.max_tokens,
+                is_truncated=_answered_nothing,
+                label=f"{self.model} tool round",
+            )
 
             if message.stop_reason != "tool_use":
                 raw_text = self._extract_text(message)
@@ -174,11 +228,7 @@ class AnthropicClient:
         return self.usage.total_cost_usd
 
     def _extract_text(self, message: Any) -> str:
-        parts: list[str] = []
-        for block in message.content:
-            if block.type == "text":
-                parts.append(block.text)
-        return "".join(parts)
+        return _extract_text(message)
 
     def _record_usage(self, message: Any, model: str | None = None) -> None:
         effective_model = model or self.model

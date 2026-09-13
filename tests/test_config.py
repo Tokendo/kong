@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from kong.config import LLMConfig, LLMProvider
+import tempfile
+from dataclasses import MISSING, fields
+from pathlib import Path
+
+from kong.config import GhidraConfig, LLMConfig, LLMProvider
 
 
 class TestLLMProviderCustom:
@@ -35,3 +39,22 @@ class TestLLMConfigCustomFields:
         assert cfg.provider is LLMProvider.CUSTOM
         assert cfg.base_url == "http://localhost:11434/v1"
         assert cfg.max_prompt_chars == 32000
+
+
+class TestGhidraConfigPaths:
+    def test_project_dir_is_under_the_platform_temp_dir(self):
+        cfg = GhidraConfig(install_dir="/somewhere")
+        assert Path(cfg.project_dir).parent == Path(tempfile.gettempdir())
+
+    def test_project_dir_default_is_computed_not_hardcoded(self):
+        """A literal /tmp default is not a usable path on Windows."""
+        field_def = fields(GhidraConfig)[1]
+        assert field_def.name == "project_dir"
+        assert field_def.default is MISSING
+        assert field_def.default_factory is not MISSING
+
+    def test_default_is_stable_across_instances(self):
+        assert (
+            GhidraConfig(install_dir="/a").project_dir
+            == GhidraConfig(install_dir="/b").project_dir
+        )

@@ -65,6 +65,17 @@ class StructAccumulator:
             )
             self._proposals.append(tagged)
 
+    def drop_proposals(self, func_addr: int) -> int:
+        """Forget what one function proposed. Returns how many were dropped.
+
+        Used when a function is analyzed twice: the second answer replaces the
+        first one here too, instead of both of them voting in `unify`.
+        """
+        kept = [p for p in self._proposals if p.source_function != func_addr]
+        dropped = len(self._proposals) - len(kept)
+        self._proposals = kept
+        return dropped
+
     def unify(self) -> list[UnifiedStruct]:
         """Merge proposals that describe the same struct.
 

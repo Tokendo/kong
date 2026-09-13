@@ -58,6 +58,15 @@ def write_config(key: str, value: str) -> None:
         conn.close()
 
 
+def delete_config(key: str) -> None:
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM config WHERE key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def write_configs(pairs: dict[str, str]) -> None:
     conn = _connect()
     try:
@@ -93,6 +102,34 @@ def get_enabled_providers() -> list[LLMProvider]:
         return [LLMProvider(v) for v in json.loads(raw)]
     except (json.JSONDecodeError, ValueError):
         return []
+
+
+def api_key_config_key(provider: LLMProvider) -> str:
+    """Config entry holding *provider*'s API key.
+
+    The custom endpoint's key has lived under this name since before other
+    providers could be stored, so the scheme is the one already on disk.
+    """
+    return f"{provider.value}_api_key"
+
+
+def get_saved_api_key(provider: LLMProvider) -> str | None:
+    """The API key saved for *provider*, if one was ever saved."""
+    value = read_config(api_key_config_key(provider))
+    return value or None
+
+
+def save_api_key(provider: LLMProvider, key: str) -> None:
+    """Store *provider*'s API key, or forget it when *key* is empty.
+
+    Keys are written to the same local config database as the rest of the
+    setup, in clear: it is a convenience store, not a secret manager.
+    """
+    key = key.strip()
+    if key:
+        write_config(api_key_config_key(provider), key)
+    else:
+        delete_config(api_key_config_key(provider))
 
 
 _CUSTOM_KEYS = [
