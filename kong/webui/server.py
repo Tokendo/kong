@@ -708,8 +708,11 @@ def launch(
     """Serve the interface until Ctrl-C, or until the page asks to close."""
     server = serve(initial_binary, host, port)
     url = server.url
-    print(f"Kong is at {url}")
-    print("Keep this terminal open; Ctrl-C stops the interface.")
+    # Flushed: redirected to a file or a pipe, stdout is block-buffered, and
+    # the URL — the one thing needed to reach the interface — would sit in the
+    # buffer until the server stopped.
+    print(f"Kong is at {url}", flush=True)
+    print("Keep this terminal open; Ctrl-C stops the interface.", flush=True)
 
     if open_browser:
         # Slightly after serve_forever starts listening, so the first request
