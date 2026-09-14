@@ -5,7 +5,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import os
-import re
 
 import pytest
 from click.testing import CliRunner
@@ -93,6 +92,38 @@ def test_eval_with_test_data(tmp_path):
     assert result.exit_code == 0
     assert "hash_string" in result.output
     assert "Symbol Accuracy" in result.output
+
+
+class TestConsoleIsPlainUnderTest:
+    """Assertions read what a command printed, so nothing may colour it.
+
+    rich decides at construction whether to emit escape sequences, and Kong
+    builds its Console when kong.__main__ is imported — so a developer whose
+    terminal exports FORCE_COLOR used to get escape codes wrapped around every
+    number in the captured output, and tests failed on a machine where nothing
+    was wrong. tests/conftest.py settles it before any of that happens; these
+    are what say so if it is ever removed.
+    """
+
+    def test_the_console_kong_writes_through_is_not_a_terminal(self):
+        from kong.__main__ import console
+
+        assert console.is_terminal is False
+        assert console.color_system is None
+
+    def test_command_output_carries_no_escape_sequences(self, tmp_path):
+        analysis = tmp_path / "analysis.json"
+        analysis.write_text(
+            '{"binary": {"name": "t"}, "stats": {"llm_calls": 1, '
+            '"duration_seconds": 1.0, "cost_usd": 0.01}, "functions": []}',
+            encoding="utf-8",
+        )
+        source = tmp_path / "t.c"
+        source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+        result = CliRunner().invoke(cli, ["eval", str(analysis), str(source)])
+
+        assert "\x1b[" not in result.output
 
 
 class TestBannerCustomProvider:
@@ -844,7 +875,5 @@ class TestTranspileSelectionGuards:
         ])
 
         assert result.exit_code == 1
-        # rich hard-wraps the console and colours it when FORCE_COLOR is set,
-        # so compare on plain text with the whitespace normalised.
-        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "no translation was asked for" in " ".join(plain.split())
+        # rich hard-wraps the console, so compare on normalised whitespace.
+        assert "no translation was asked for" in " ".join(result.output.split())

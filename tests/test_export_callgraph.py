@@ -9,7 +9,6 @@ needs the edges recovering, not the analysis buying again.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -302,10 +301,8 @@ class TestCommand:
         result = CliRunner().invoke(cli, ["graph", str(out)])
 
         assert result.exit_code == 0
-        # rich colours the count, so the digits and the words are not adjacent.
-        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "1 call edges" in plain
-        assert "decompiled.c" in plain
+        assert "1 call edges" in result.output
+        assert "decompiled.c" in result.output
 
     def test_it_says_what_it_could_not_do(self, tmp_path):
         out = _analysis(tmp_path / "out")
