@@ -101,3 +101,24 @@ class FunctionResult:
     struct_proposals: list[StructProposal] = field(default_factory=list)
     obfuscation_techniques: list[str] = field(default_factory=list)
     deobfuscation_tool_calls: int = 0
+
+
+@dataclass(frozen=True)
+class PhaseFailure:
+    """A pipeline phase that failed without stopping the run.
+
+    Synthesis and the transpiling exporters are best-effort: when one raises,
+    the supervisor logs it and moves on, because the function-level work is
+    already done and worth exporting. That made the failure invisible in the
+    deliverable — the run reported "complete", and analysis.json carried no
+    sign that a phase was missing from it. These are what the export reports
+    instead, alongside the per-function `failures`.
+    """
+
+    #: Phase.value, e.g. "synthesis".
+    phase: str
+    #: str() of the exception, as the user sees it in events.log.
+    error: str
+    #: What was being produced when it failed, when a phase has more than one
+    #: product — the target language of an export, say. Empty otherwise.
+    detail: str = ""

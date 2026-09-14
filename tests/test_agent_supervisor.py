@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1963,3 +1963,98 @@ class TestStagedRun:
 
         assert sup.results[0x1000].name == "parse_http_header"
         assert sup.stats.errors == 0
+
+
+class TestPhaseFailuresReachTheExport:
+    """A best-effort phase that fails is recorded, not just logged.
+
+    On the FA18 run synthesis timed out after an hour, the supervisor logged a
+    warning and returned, and the run reported "Analysis complete" with an
+    analysis.json that carried no trace of the missing phase.
+    """
+
+    def _supervisor(self, tmp_path, llm_client=None):
+        client = _make_client()
+        config = KongConfig(output=OutputConfig(directory=tmp_path / "out"))
+        return Supervisor(client, config, llm_client=llm_client)
+
+    def test_nothing_recorded_on_a_clean_run(self, tmp_path):
+        sup = self._supervisor(tmp_path)
+        assert sup.phase_failures == []
+
+    def test_a_synthesis_timeout_is_recorded(self, tmp_path):
+        mock_llm = MagicMock()
+        mock_llm.model = "glm-5.3"
+        sup = self._supervisor(tmp_path, llm_client=mock_llm)
+        sup.results = {
+            0x1000: FunctionResult(address=0x1000, original_name="FUN_00001000"),
+        }
+
+        with patch(
+            "kong.agent.supervisor.SemanticSynthesizer",
+        ) as mock_synth:
+            mock_synth.return_value.synthesize.side_effect = TimeoutError(
+                "Request timed out."
+            )
+            sup._run_synthesis()
+
+        assert [(f.phase, f.error) for f in sup.phase_failures] == [
+            ("synthesis", "Request timed out.")
+        ]
+
+    def test_the_run_still_carries_on_after_one(self, tmp_path):
+        """The phase is best-effort by design; recording it must not change that."""
+        mock_llm = MagicMock()
+        mock_llm.model = "glm-5.3"
+        sup = self._supervisor(tmp_path, llm_client=mock_llm)
+        sup.results = {
+            0x1000: FunctionResult(address=0x1000, original_name="FUN_00001000"),
+        }
+
+        with patch("kong.agent.supervisor.SemanticSynthesizer") as mock_synth:
+            mock_synth.return_value.synthesize.side_effect = TimeoutError("boom")
+            sup._run_synthesis()  # does not raise
+
+        assert sup.phase_failures
+
+    def test_it_reaches_analysis_json(self, tmp_path):
+        sup = self._supervisor(tmp_path)
+        sup.binary_info = BinaryInfo(
+            arch="x86", format="PE", endianness="little", word_size=4,
+            compiler="windows", name="FA18.exe",
+        )
+        sup.results = {
+            0x1000: FunctionResult(
+                address=0x1000, original_name="FUN_00001000", name="main",
+                confidence=90,
+            ),
+        }
+        sup._record_phase_failure(Phase.SYNTHESIS, TimeoutError("Request timed out."))
+
+        sup._run_export()
+
+        document = json.loads(
+            (tmp_path / "out" / "analysis.json").read_text()
+        )
+        assert document["phase_failures"] == [
+            {"phase": "synthesis", "error": "Request timed out."}
+        ]
+
+    def test_it_reaches_the_decompiled_c_header(self, tmp_path):
+        sup = self._supervisor(tmp_path)
+        sup.binary_info = BinaryInfo(
+            arch="x86", format="PE", endianness="little", word_size=4,
+            compiler="windows", name="FA18.exe",
+        )
+        sup.results = {
+            0x1000: FunctionResult(
+                address=0x1000, original_name="FUN_00001000", name="main",
+                confidence=90,
+            ),
+        }
+        sup._record_phase_failure(Phase.SYNTHESIS, TimeoutError("Request timed out."))
+
+        sup._run_export()
+
+        header = (tmp_path / "out" / "decompiled.c").read_text()
+        assert "INCOMPLETE: synthesis failed - Request timed out." in header

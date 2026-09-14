@@ -99,6 +99,11 @@ class LLMConfig:
     #: allows.
     max_chunk_functions: int | None = None
     max_output_tokens: int | None = None
+    #: Seconds to wait on one LLM request before giving up on it. None means
+    #: the client default. Worth raising for a local endpoint that generates
+    #: slowly, and lowering for a hosted one that should answer promptly: it
+    #: bounds what a request that will never be answered costs the run.
+    request_timeout: float | None = None
 
 
 @dataclass

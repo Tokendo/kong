@@ -276,3 +276,111 @@ class TestToolCallsWithoutFinishReason:
 
         assert result.name == "done"
         assert mock_client.chat.completions.create.call_count == 1
+
+
+class TestBudgetCap:
+    """A budget the endpoint cannot generate before the deadline is not asked for.
+
+    Kong does not stream, so a completion comes back only once it is finished.
+    Retrying a truncated call at a budget the endpoint has no time to produce
+    spends the whole deadline and returns just as empty — the failure that cost
+    the FA18 run two hours across two functions.
+    """
+
+    def test_no_cap_before_the_endpoint_has_been_measured(self):
+        client = OpenAIClient(api_key="k")
+        assert client._budget_cap() == MAX_TOKENS_CAP
+
+    def test_a_slow_endpoint_caps_the_retry(self):
+        client = OpenAIClient(api_key="k", timeout=600.0)
+        # 20 tokens/second, the rate the FA18 run actually saw.
+        for _ in range(5):
+            client._observe(_openai_response("x"), 50 / 20)
+
+        assert client._budget_cap() == 12000
+        assert next_budget(32000, client._budget_cap()) is None
+
+    def test_a_fast_endpoint_does_not_cap_the_retry(self):
+        client = OpenAIClient(api_key="k", timeout=600.0)
+        for _ in range(5):
+            client._observe(_openai_response("x"), 50 / 500)
+
+        assert next_budget(16384, client._budget_cap()) == 32768
+
+    def test_a_longer_deadline_buys_a_bigger_budget(self):
+        slow = OpenAIClient(api_key="k", timeout=600.0)
+        patient = OpenAIClient(api_key="k", timeout=3600.0)
+        for client in (slow, patient):
+            for _ in range(5):
+                client._observe(_openai_response("x"), 50 / 20)
+
+        assert patient._budget_cap() == 6 * slow._budget_cap()
+
+    def test_an_untimed_call_does_not_count_as_a_sample(self):
+        client = OpenAIClient(api_key="k")
+        for _ in range(5):
+            client._observe(_openai_response("x"), 0.0)
+
+        assert client._budget_cap() == MAX_TOKENS_CAP
+
+    def test_the_capped_retry_is_skipped_rather_than_sent(self, caplog):
+        sent = []
+
+        with caplog.at_level(logging.WARNING, logger="kong.llm.truncation"):
+            call_with_budget(
+                lambda b: sent.append(b) or "",
+                budget=32000,
+                is_truncated=lambda r: r == "",
+                label="slow-model function analysis",
+                max_budget=12000,
+            )
+
+        assert sent == [32000]
+        assert "not retrying" in caplog.text
+
+    def test_the_anthropic_client_caps_the_same_way(self):
+        client = AnthropicClient(api_key="k", timeout=600.0)
+        assert client._budget_cap() == MAX_TOKENS_CAP
+        for _ in range(5):
+            client._observe(_anthropic_message("x"), 50 / 20)
+
+        assert client._budget_cap() == 12000
+
+
+class TestRequestDeadline:
+    """The deadline is explicit, and bounded by a small retry count.
+
+    Left to the SDK a request waits 600s per attempt and Kong asked for five
+    retries on top, so a request that could never be answered was not reported
+    for an hour.
+    """
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_openai_gets_an_explicit_deadline_and_few_retries(self, mock_openai_cls):
+        OpenAIClient(api_key="k", timeout=120.0, max_retries=1)
+
+        kwargs = mock_openai_cls.call_args.kwargs
+        assert kwargs["max_retries"] == 1
+        assert kwargs["timeout"].read == 120.0
+        assert kwargs["timeout"].connect == 10.0
+
+    @patch("kong.llm.client.anthropic.Anthropic")
+    def test_anthropic_gets_an_explicit_deadline_and_few_retries(self, mock_cls):
+        AnthropicClient(api_key="k", timeout=120.0, max_retries=1)
+
+        kwargs = mock_cls.call_args.kwargs
+        assert kwargs["max_retries"] == 1
+        assert kwargs["timeout"].read == 120.0
+
+    @patch("kong.llm.openai_client.openai.OpenAI")
+    def test_every_request_carries_the_deadline(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _openai_response(
+            '{"name": "f", "confidence": 90}'
+        )
+
+        client = OpenAIClient(api_key="k", timeout=42.0)
+        client.analyze_function("prompt")
+
+        assert mock_client.chat.completions.create.call_args.kwargs["timeout"] == 42.0

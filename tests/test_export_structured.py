@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kong.agent.models import AnalysisStats, FunctionResult
+from kong.agent.models import AnalysisStats, FunctionResult, PhaseFailure
 from kong.config import LLMProvider
 from kong.export.source import ExportData
 from kong.export.structured import export_json
@@ -368,3 +368,59 @@ class TestTwoPassFields:
         )
 
         assert entry["refined"] is True
+
+
+class TestPhaseFailures:
+    """A phase that fell over says so in the document, not only in events.log.
+
+    Synthesis and the transpiling exporters are best-effort: the supervisor
+    logs the exception and carries on, because the per-function work is done
+    and worth exporting. On the FA18 run that left analysis.json with no sign
+    that synthesis had timed out, and the run still reported "complete".
+    """
+
+    def test_empty_when_every_phase_succeeded(
+        self, tmp_path, binary_info, stats, token_usage, sample_results,
+    ):
+        data = _make_data(binary_info, stats, token_usage, sample_results)
+
+        document = _export_and_load(data, tmp_path)
+
+        assert document["phase_failures"] == []
+
+    def test_a_failed_phase_is_reported(
+        self, tmp_path, binary_info, stats, token_usage, sample_results,
+    ):
+        data = _make_data(binary_info, stats, token_usage, sample_results)
+        data.phase_failures = [
+            PhaseFailure(phase="synthesis", error="Request timed out.")
+        ]
+
+        document = _export_and_load(data, tmp_path)
+
+        assert document["phase_failures"] == [
+            {"phase": "synthesis", "error": "Request timed out."}
+        ]
+
+    def test_a_detail_says_which_product_was_lost(
+        self, tmp_path, binary_info, stats, token_usage, sample_results,
+    ):
+        data = _make_data(binary_info, stats, token_usage, sample_results)
+        data.phase_failures = [
+            PhaseFailure(phase="export", error="boom", detail="rust")
+        ]
+
+        entry = _export_and_load(data, tmp_path)["phase_failures"][0]
+
+        assert entry["detail"] == "rust"
+
+    def test_it_is_separate_from_the_per_function_failures(
+        self, tmp_path, binary_info, stats, token_usage, sample_results,
+    ):
+        data = _make_data(binary_info, stats, token_usage, sample_results)
+        data.phase_failures = [PhaseFailure(phase="synthesis", error="boom")]
+
+        document = _export_and_load(data, tmp_path)
+
+        assert [f["address"] for f in document["failures"]] == ["0x00004000"]
+        assert len(document["phase_failures"]) == 1

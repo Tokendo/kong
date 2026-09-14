@@ -112,11 +112,9 @@ class TestCreateLLMClient:
         )
         client = create_llm_client(config)
         assert isinstance(client, OpenAIClient)
-        mock_openai_cls.assert_called_once_with(
-            api_key="test-key",
-            base_url="http://localhost:11434/v1",
-            max_retries=5,
-        )
+        kwargs = mock_openai_cls.call_args.kwargs
+        assert kwargs["api_key"] == "test-key"
+        assert kwargs["base_url"] == "http://localhost:11434/v1"
 
     @patch("kong.llm.openai_client.openai.OpenAI")
     def test_custom_no_auth_passes_empty_string(self, mock_openai_cls):
@@ -129,11 +127,9 @@ class TestCreateLLMClient:
         )
         client = create_llm_client(config)
         assert isinstance(client, OpenAIClient)
-        mock_openai_cls.assert_called_once_with(
-            api_key=_NOT_NEEDED_STR,
-            base_url="http://localhost:11434/v1",
-            max_retries=5,
-        )
+        kwargs = mock_openai_cls.call_args.kwargs
+        assert kwargs["api_key"] == _NOT_NEEDED_STR
+        assert kwargs["base_url"] == "http://localhost:11434/v1"
 
     @patch("kong.llm.openai_client.openai.OpenAI")
     def test_openai_returns_openai_client_no_base_url(self, mock_openai_cls):
@@ -142,11 +138,9 @@ class TestCreateLLMClient:
         config = LLMConfig(provider=LLMProvider.OPENAI, model="gpt-4o")
         client = create_llm_client(config)
         assert isinstance(client, OpenAIClient)
-        mock_openai_cls.assert_called_once_with(
-            api_key=None,
-            base_url=None,
-            max_retries=5,
-        )
+        kwargs = mock_openai_cls.call_args.kwargs
+        assert kwargs["api_key"] is None
+        assert kwargs["base_url"] is None
 
     @patch("kong.llm.openai_client.openai.OpenAI")
     def test_zai_uses_its_own_endpoint_and_key(self, mock_openai_cls, monkeypatch):
@@ -161,11 +155,9 @@ class TestCreateLLMClient:
         )
 
         assert isinstance(client, OpenAIClient)
-        mock_openai_cls.assert_called_once_with(
-            api_key="zai-test-key",
-            base_url=ZAI_BASE_URL,
-            max_retries=5,
-        )
+        kwargs = mock_openai_cls.call_args.kwargs
+        assert kwargs["api_key"] == "zai-test-key"
+        assert kwargs["base_url"] == ZAI_BASE_URL
 
     @patch("kong.llm.openai_client.openai.OpenAI")
     def test_zai_base_url_can_be_overridden_for_a_coding_plan_key(

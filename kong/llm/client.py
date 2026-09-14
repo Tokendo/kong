@@ -8,14 +8,16 @@ Tracks token usage and cost per call.  Supports both simple
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import anthropic
+import httpx
 
 from kong.agent.analyzer import Analyzer, LLMResponse
 from kong.agent.prompts import BATCH_OUTPUT_SCHEMA, BATCH_SYSTEM_PROMPT, OUTPUT_SCHEMA, SYSTEM_PROMPT
 from kong.llm.tools import ToolExecutor
-from kong.llm.truncation import call_with_budget
+from kong.llm.truncation import MAX_TOKENS_CAP, call_with_budget
 from kong.llm.usage import TokenUsage
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,24 @@ DEFAULT_MODEL = "claude-opus-5"
 
 # Output budget for a batch call when the caller does not set one.
 DEFAULT_BATCH_MAX_TOKENS = 16384
+
+#: Ceiling on any single request, in seconds. Left to itself the SDK applies
+#: its own default to every attempt and multiplies it by the retry count, so a
+#: request the endpoint never answers is not reported for the best part of an
+#: hour. See kong.llm.openai_client for the same constants on the other side.
+DEFAULT_TIMEOUT_SECONDS = 600.0
+
+#: A connection that has not opened by now is not going to.
+CONNECT_TIMEOUT_SECONDS = 10.0
+
+#: Completed calls to time before the measured output rate is trusted. Below
+#: this the client makes no assumption about the endpoint's speed.
+MIN_RATE_SAMPLES = 3
+
+#: Attempts the SDK makes on a connection error or a timeout. A timeout is
+#: usually a budget the endpoint cannot deliver in time: it reproduces on the
+#: retry and is paid for in full each round, so keep the multiplier small.
+DEFAULT_MAX_RETRIES = 2
 
 
 def _extract_text(message: Any) -> str:
@@ -59,20 +79,59 @@ class AnthropicClient:
         model: str = DEFAULT_MODEL,
         max_tokens: int = 2048,
         api_key: str | None = None,
+        timeout: float | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
-        self._client = anthropic.Anthropic(api_key=api_key, max_retries=5)
+        self.timeout = timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
+        self._client = anthropic.Anthropic(
+            api_key=api_key,
+            max_retries=max_retries,
+            timeout=httpx.Timeout(self.timeout, connect=CONNECT_TIMEOUT_SECONDS),
+        )
         self.usage = TokenUsage()
+        #: Output tokens generated and seconds spent generating them, summed
+        #: over completed calls. See `_budget_cap`.
+        self._tokens_generated = 0
+        self._generation_seconds = 0.0
+        self._timed_calls = 0
+
+    def _observe(self, message: Any, seconds: float) -> None:
+        """Record how fast the endpoint generated one message."""
+        generated = getattr(message.usage, "output_tokens", 0) or 0
+        if generated <= 0 or seconds <= 0:
+            return
+        self._tokens_generated += generated
+        self._generation_seconds += seconds
+        self._timed_calls += 1
+
+    def _budget_cap(self) -> int:
+        """The largest output budget this endpoint can deliver before the deadline.
+
+        Kong does not stream, so a message returns nothing until it is
+        finished: a budget the endpoint cannot generate within `timeout`
+        cannot come back, however often it is asked for, and retrying a
+        truncated call at one spends the whole deadline to arrive just as
+        empty. Measured rather than assumed — see the OpenAI client for the
+        reasoning in full. Until there are enough samples this is the module
+        ceiling, i.e. no cap at all.
+        """
+        if self._timed_calls < MIN_RATE_SAMPLES or self._generation_seconds <= 0:
+            return MAX_TOKENS_CAP
+        rate = self._tokens_generated / self._generation_seconds
+        return int(rate * self.timeout)
 
     def analyze_function(self, prompt: str, *, model: str | None = None) -> LLMResponse:
         """Send an analysis prompt and return parsed response (no tools)."""
         effective_model = model or self.model
 
         def send(budget: int) -> Any:
+            started = time.monotonic()
             message = self._client.messages.create(
                 model=effective_model,
                 max_tokens=budget,
+                timeout=self.timeout,
                 system=[{
                     "type": "text",
                     "text": f"{SYSTEM_PROMPT}\n\n{OUTPUT_SCHEMA}",
@@ -86,6 +145,7 @@ class AnthropicClient:
                 ],
             )
             self._record_usage(message, effective_model)
+            self._observe(message, time.monotonic() - started)
             return message
 
         message = call_with_budget(
@@ -93,6 +153,7 @@ class AnthropicClient:
             budget=self.max_tokens,
             is_truncated=_answered_nothing,
             label=f"{effective_model} function analysis",
+            max_budget=self._budget_cap(),
         )
 
         raw_text = self._extract_text(message)
@@ -113,9 +174,11 @@ class AnthropicClient:
         effective_model = model or self.model
 
         def send(budget: int) -> Any:
+            started = time.monotonic()
             message = self._client.messages.create(
                 model=effective_model,
                 max_tokens=budget,
+                timeout=self.timeout,
                 system=[{
                     "type": "text",
                     "text": f"{BATCH_SYSTEM_PROMPT}\n\n{BATCH_OUTPUT_SCHEMA}",
@@ -126,6 +189,7 @@ class AnthropicClient:
                 ],
             )
             self._record_usage(message, effective_model)
+            self._observe(message, time.monotonic() - started)
             return message
 
         # A truncated batch costs every function in the chunk, not one.
@@ -134,6 +198,7 @@ class AnthropicClient:
             budget=max_tokens or DEFAULT_BATCH_MAX_TOKENS,
             is_truncated=_answered_nothing,
             label=f"{effective_model} chunk analysis",
+            max_budget=self._budget_cap(),
         )
 
         raw_text = self._extract_text(message)
@@ -173,9 +238,11 @@ class AnthropicClient:
 
         def send(budget: int) -> Any:
             nonlocal total_input, total_output
+            started = time.monotonic()
             message = self._client.messages.create(
                 model=self.model,
                 max_tokens=budget,
+                timeout=self.timeout,
                 system=cached_system,
                 tools=tools,
                 messages=messages,
@@ -183,6 +250,7 @@ class AnthropicClient:
             total_input += message.usage.input_tokens
             total_output += message.usage.output_tokens
             self._record_usage(message, self.model)
+            self._observe(message, time.monotonic() - started)
             return message
 
         for _ in range(max_rounds):
@@ -191,6 +259,7 @@ class AnthropicClient:
                 budget=self.max_tokens,
                 is_truncated=_answered_nothing,
                 label=f"{self.model} tool round",
+                max_budget=self._budget_cap(),
             )
 
             if message.stop_reason != "tool_use":

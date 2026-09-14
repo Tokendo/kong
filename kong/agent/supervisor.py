@@ -24,7 +24,7 @@ from kong.agent.coherence import (
 )
 from kong.agent.deobfuscator import Deobfuscator, classify_obfuscation
 from kong.agent.events import Event, EventCallback, EventType, Phase
-from kong.agent.models import AnalysisStats, FunctionResult
+from kong.agent.models import AnalysisStats, FunctionResult, PhaseFailure
 from kong.agent.queue import WorkItem, WorkQueue
 from kong.agent.refinement import refinement_reason, should_draft
 from kong.agent.run_log import RunLog
@@ -87,6 +87,10 @@ class Supervisor:
         self.queue = WorkQueue()
         self.stats = AnalysisStats()
         self.results: dict[int, FunctionResult] = {}
+        #: Phases that failed without stopping the run. Exported alongside the
+        #: per-function failures so a partial result says so in the artefact
+        #: and not only in events.log.
+        self.phase_failures: list[PhaseFailure] = []
         self.triage_result: TriageResult | None = None
         self.binary_info: BinaryInfo | None = None
         self.functions: list[FunctionInfo] = []
@@ -1808,6 +1812,18 @@ class Supervisor:
             data={"structs_created": structs_created},
         ))
 
+    def _record_phase_failure(
+        self, phase: Phase, error: Exception, *, detail: str = "",
+    ) -> None:
+        """Note a phase that failed but let the run carry on.
+
+        The event this accompanies reaches whoever was watching live; this is
+        what reaches whoever reads analysis.json afterwards.
+        """
+        self.phase_failures.append(
+            PhaseFailure(phase=phase.value, error=str(error), detail=detail)
+        )
+
     def _run_synthesis(self) -> None:
         """Cross-function synthesis: unify globals, synthesize structs, refine names."""
         self._emit(Event(
@@ -1850,6 +1866,7 @@ class Supervisor:
             )
         except Exception as e:
             logger.warning("Synthesis failed: %s", e)
+            self._record_phase_failure(Phase.SYNTHESIS, e)
             self._emit(Event(
                 type=EventType.PHASE_COMPLETE,
                 phase=Phase.SYNTHESIS,
@@ -1942,6 +1959,7 @@ class Supervisor:
             token_usage=token_usage,
             duration_seconds=self.stats.duration_seconds,
             provider=self.config.llm.provider,
+            phase_failures=list(self.phase_failures),
         )
 
         formats = self.config.output.formats
@@ -1979,6 +1997,7 @@ class Supervisor:
                 )
             except Exception as e:
                 logger.warning("%s export failed: %s", language.display_name, e)
+                self._record_phase_failure(Phase.EXPORT, e, detail=language.value)
                 self._emit(Event(
                     type=EventType.PHASE_COMPLETE,
                     phase=Phase.EXPORT,
@@ -1994,6 +2013,10 @@ class Supervisor:
             ))
 
         if "json" in formats:
+            # Refreshed rather than left as built: a transpiling export that
+            # failed just above is a phase failure too, and json is written
+            # last precisely so it can still report one.
+            export_data.phase_failures = list(self.phase_failures)
             path = export_json(export_data, output_dir / "analysis.json")
             self._emit(Event(
                 type=EventType.EXPORT_FILE,

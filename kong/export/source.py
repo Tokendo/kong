@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -9,7 +9,7 @@ from kong.ghidra.types import BinaryInfo
 from kong.llm.usage import TokenUsage
 
 if TYPE_CHECKING:
-    from kong.agent.models import AnalysisStats, FunctionResult
+    from kong.agent.models import AnalysisStats, FunctionResult, PhaseFailure
 
 SECTION_ORDER: list[tuple[str, str]] = [
     ("crypto", "Crypto"),
@@ -39,6 +39,9 @@ class ExportData:
     token_usage: TokenUsage
     duration_seconds: float
     provider: LLMProvider | None = None
+    #: Phases that failed without stopping the run. Reported in the artefacts
+    #: so a partial result is legible without reading events.log.
+    phase_failures: list[PhaseFailure] = field(default_factory=list)
 
 
 def _format_header(data: ExportData) -> str:
@@ -58,8 +61,13 @@ def _format_header(data: ExportData) -> str:
         f" * LLM calls: {s.llm_calls}",
         f" * Duration:  {int(minutes)}m {seconds:.1f}s",
         f" * Cost:      ${data.token_usage.total_cost_usd:.4f}",
-        f" * {'=' * 60} */",
     ]
+    # A phase that failed silently is the difference between a whole result
+    # and a partial one, so it belongs at the top of the file it truncated.
+    for failure in data.phase_failures:
+        what = f"{failure.phase} ({failure.detail})" if failure.detail else failure.phase
+        lines.append(f" * INCOMPLETE: {what} failed - {failure.error}")
+    lines.append(f" * {'=' * 60} */")
     return "\n".join(lines)
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from kong.agent.models import FunctionResult
+from kong.agent.models import FunctionResult, PhaseFailure
 from kong.config import LLMProvider
 from kong.export.source import ExportData
 
@@ -68,6 +68,13 @@ def _build_failure_entry(result: FunctionResult) -> dict[str, str]:
     }
 
 
+def _build_phase_failure_entry(failure: PhaseFailure) -> dict[str, str]:
+    entry = {"phase": failure.phase, "error": failure.error}
+    if failure.detail:
+        entry["detail"] = failure.detail
+    return entry
+
+
 def export_json(data: ExportData, output_path: Path) -> Path:
     includable = [
         result for result in data.results.values()
@@ -87,6 +94,12 @@ def export_json(data: ExportData, output_path: Path) -> Path:
         "stats": _build_stats_section(data),
         "functions": [_build_function_entry(r) for r in includable],
         "failures": [_build_failure_entry(r) for r in failures],
+        # Whole phases that fell over. A best-effort phase logs and returns, so
+        # without this a run that lost its synthesis still reported success and
+        # the document simply had nothing where the synthesis should have been.
+        "phase_failures": [
+            _build_phase_failure_entry(f) for f in data.phase_failures
+        ],
     }
 
     output_path.write_text(json.dumps(document, indent=2))

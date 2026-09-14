@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
+import httpx
 import openai
 
 from kong.agent.analyzer import Analyzer, LLMResponse
 from kong.agent.prompts import BATCH_OUTPUT_SCHEMA, BATCH_SYSTEM_PROMPT, OUTPUT_SCHEMA, SYSTEM_PROMPT
 from kong.llm.tools import ToolExecutor
-from kong.llm.truncation import call_with_budget
+from kong.llm.truncation import MAX_TOKENS_CAP, call_with_budget
 from kong.llm.usage import TokenUsage
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,28 @@ DEFAULT_MODEL = "gpt-4o"
 
 # Output budget for a batch call when the caller does not set one.
 DEFAULT_BATCH_MAX_TOKENS = 16384
+
+#: Ceiling on any single request, in seconds. The SDK's own default is 600s,
+#: which it applies to every attempt and multiplies by its retry count: a call
+#: an endpoint could never answer used to sit there for an hour before raising
+#: APITimeoutError, and a long run could spend a third of its wall clock that
+#: way. Set it from the slowest answer the endpoint is expected to produce.
+DEFAULT_TIMEOUT_SECONDS = 600.0
+
+#: A connection that has not opened by now is not going to.
+CONNECT_TIMEOUT_SECONDS = 10.0
+
+#: Completed calls to time before the measured output rate is trusted. Below
+#: this the client makes no assumption about the endpoint's speed and lets the
+#: truncation retry grow as far as it likes.
+MIN_RATE_SAMPLES = 3
+
+#: Attempts the SDK makes on a connection error or a timeout. A timeout is
+#: usually a budget the endpoint cannot deliver in time, which reproduces
+#: exactly on a retry and is paid for in full each round, so keep the
+#: multiplier small — the SDK's default of 2 with Kong's old 5 meant six
+#: full-length waits before anything was reported.
+DEFAULT_MAX_RETRIES = 2
 
 
 def _answered_nothing(response: Any) -> bool:
@@ -73,20 +97,64 @@ class OpenAIClient:
         max_tokens: int = 2048,
         api_key: str | None = None,
         base_url: str | None = None,
+        timeout: float | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
-        self._client = openai.OpenAI(api_key=api_key, base_url=base_url, max_retries=5)
+        self.timeout = timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
+        self._client = openai.OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=max_retries,
+            timeout=httpx.Timeout(self.timeout, connect=CONNECT_TIMEOUT_SECONDS),
+        )
         self.usage = TokenUsage()
+        #: Output tokens generated and seconds spent generating them, summed
+        #: over completed calls. See `_budget_cap`.
+        self._tokens_generated = 0
+        self._generation_seconds = 0.0
+        self._timed_calls = 0
+
+    def _observe(self, response: Any, seconds: float) -> None:
+        """Record how fast the endpoint generated one completion."""
+        generated = getattr(response.usage, "completion_tokens", 0) or 0
+        if generated <= 0 or seconds <= 0:
+            return
+        self._tokens_generated += generated
+        self._generation_seconds += seconds
+        self._timed_calls += 1
+
+    def _budget_cap(self) -> int:
+        """The largest output budget this endpoint can deliver before the deadline.
+
+        Kong does not stream, so a completion returns nothing at all until it
+        is finished: a budget the endpoint cannot generate within `timeout`
+        cannot come back, however many times it is asked for. Retrying a
+        truncated call at such a budget spends the whole deadline to arrive at
+        the same empty answer, which is how a single unanswerable function
+        used to cost an hour.
+
+        Measured rather than assumed: hosted endpoints and a local server on a
+        laptop are two orders of magnitude apart, and only the endpoint on the
+        day knows which this is. Until there are enough samples the cap is the
+        module ceiling, i.e. no cap at all.
+        """
+        if self._timed_calls < MIN_RATE_SAMPLES or self._generation_seconds <= 0:
+            return MAX_TOKENS_CAP
+        rate = self._tokens_generated / self._generation_seconds
+        return int(rate * self.timeout)
 
     def analyze_function(self, prompt: str, *, model: str | None = None) -> LLMResponse:
         """Send an analysis prompt and return parsed response (no tools)."""
         effective_model = model or self.model
 
         def send(budget: int) -> Any:
+            started = time.monotonic()
             response = self._client.chat.completions.create(
                 model=effective_model,
                 max_tokens=budget,
+                timeout=self.timeout,
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{OUTPUT_SCHEMA}"},
@@ -94,6 +162,7 @@ class OpenAIClient:
                 ],
             )
             self._record_usage(response, effective_model)
+            self._observe(response, time.monotonic() - started)
             return response
 
         response = call_with_budget(
@@ -101,6 +170,7 @@ class OpenAIClient:
             budget=self.max_tokens,
             is_truncated=_answered_nothing,
             label=f"{effective_model} function analysis",
+            max_budget=self._budget_cap(),
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -121,15 +191,18 @@ class OpenAIClient:
         effective_model = model or self.model
 
         def send(budget: int) -> Any:
+            started = time.monotonic()
             response = self._client.chat.completions.create(
                 model=effective_model,
                 max_tokens=budget,
+                timeout=self.timeout,
                 messages=[
                     {"role": "system", "content": f"{BATCH_SYSTEM_PROMPT}\n\n{BATCH_OUTPUT_SCHEMA}"},
                     {"role": "user", "content": prompt},
                 ],
             )
             self._record_usage(response, effective_model)
+            self._observe(response, time.monotonic() - started)
             return response
 
         # A truncated batch costs every function in the chunk, not one.
@@ -138,6 +211,7 @@ class OpenAIClient:
             budget=max_tokens or DEFAULT_BATCH_MAX_TOKENS,
             is_truncated=_answered_nothing,
             label=f"{effective_model} chunk analysis",
+            max_budget=self._budget_cap(),
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -176,15 +250,18 @@ class OpenAIClient:
 
         def send(budget: int) -> Any:
             nonlocal total_input, total_output
+            started = time.monotonic()
             response = self._client.chat.completions.create(
                 model=self.model,
                 max_tokens=budget,
+                timeout=self.timeout,
                 tools=openai_tools,
                 messages=messages,
             )
             total_input += response.usage.prompt_tokens
             total_output += response.usage.completion_tokens
             self._record_usage(response, self.model)
+            self._observe(response, time.monotonic() - started)
             return response
 
         for _ in range(max_rounds):
@@ -193,6 +270,7 @@ class OpenAIClient:
                 budget=self.max_tokens,
                 is_truncated=_answered_nothing,
                 label=f"{self.model} tool round",
+                max_budget=self._budget_cap(),
             )
 
             choice = response.choices[0]

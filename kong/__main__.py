@@ -76,15 +76,19 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
     from kong.llm.usage import register_custom_model
 
     model = config.model or _DEFAULT_MODELS.get(config.provider, "gpt-4o")
-    # The per-request output budget. It is the same number for every provider:
-    # a single-function call opens on the client's default (2048) and a batch
-    # call is sized by the model table, and this is what overrides both when
-    # the user has an opinion about how much one request may spend.
-    budget: dict[str, object] = (
+    # What one request may spend, in tokens and in seconds. Both are the same
+    # for every provider and both are overrides: left out, a single-function
+    # call opens on the client's default budget (2048), a batch call is sized
+    # by the model table, and the deadline is the client's own. They are here
+    # for when the user has an opinion — a local endpoint that generates
+    # slowly wants a longer deadline, a hosted one a shorter.
+    overrides: dict[str, object] = (
         {"max_tokens": config.max_output_tokens}
         if config.max_output_tokens is not None
         else {}
     )
+    if config.request_timeout is not None:
+        overrides["timeout"] = config.request_timeout
     if config.provider is LLMProvider.CUSTOM:
         # The draft model is billed and reported separately, so it needs a
         # pricing entry of its own or the usage table drops what it spent.
@@ -99,7 +103,7 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
             model=model,
             base_url=config.base_url,
             api_key=api_key,
-            **budget,
+            **overrides,
         )
     if config.provider is LLMProvider.ZAI:
         # OpenAI-compatible surface, but the key lives under its own name: the
@@ -115,18 +119,18 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
             model=model,
             base_url=config.base_url or ZAI_BASE_URL,
             api_key=api_key,
-            **budget,
+            **overrides,
         )
     if config.provider is LLMProvider.OPENAI:
         return OpenAIClient(
             model=model,
             api_key=resolve_api_key(LLMProvider.OPENAI, config.api_key),
-            **budget,
+            **overrides,
         )
     return AnthropicClient(
         model=model,
         api_key=resolve_api_key(LLMProvider.ANTHROPIC, config.api_key),
-        **budget,
+        **overrides,
     )
 
 
