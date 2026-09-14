@@ -196,8 +196,18 @@ paths you browse, or spend your key. The terminal has to stay open. Closing the
 tab leaves the run going; **Quit** stops it, checkpoints, and releases Ghidra.
 
 Configuration is on the left, the run on the right: progress, live log,
-functions as they come back, contradictions found by the coherence pass, and
-the counters — cost, tokens, elapsed, and **Waiting on model**.
+functions as they come back, contradictions found by the coherence pass, the
+call graph, and the counters — cost, tokens, elapsed, and **Waiting on model**.
+
+**Call graph.** The tab reads `analysis.json` from the output directory named
+on the form, so it works on a run that finished days ago as well as on the one
+in front of you — export writes the file, and the page is only a reader of it.
+A whole binary at once is a hairball nobody can read, so the view is one
+function's neighbourhood: callers above, callees below, click a box to walk to
+it, and filter by name or address to choose where to start. Colour encodes only
+confidence, which is what decides whether a name there can be trusted; a callee
+no pass analyzed still gets a box, marked as such. An `analysis.json` written
+before Kong saved the graph says so and asks for a re-export.
 
 **Waiting on the model.** A chunk of forty functions can be out with the model
 for minutes with nothing else moving, which looks exactly like a hung program.
@@ -391,6 +401,26 @@ which is why failures arrived in bursts. The call is now retried, and then the
 chunk is split in half and each half sent again, down to single functions, so
 what fails is the function the endpoint actually objects to and not the fifteen
 sharing its request.
+
+### An analysis that has no call graph
+
+An export written before Kong saved the graph has no `call_graph` in it, and
+one written while the Ghidra client was asking the wrong question has a nearly
+empty one. Neither needs the analysis running again: the edges come from
+Ghidra, never from the model, so recovering them costs nothing.
+
+```bash
+kong graph ./kong_output_binary                      # from decompiled.c, free
+kong graph ./kong_output_binary --binary ./binary    # from Ghidra, exact
+```
+
+With `--binary` it reopens the program and asks Ghidra, which is the same
+answer a fresh run would write. Without it, the edges are read out of the
+`decompiled.c` already sitting next to the document — nothing to install, no
+binary needed, but it sees only what the decompiler printed: a call through a
+function pointer or a vtable has no name in it and never becomes an edge. The
+document records which of the two it was given, under `call_graph.source`, so
+an approximation never passes for Ghidra's own answer.
 
 ### When functions fail
 

@@ -152,6 +152,7 @@
       <button type="button" class="tab tab--on" data-tab="log" role="tab">Log</button>
       <button type="button" class="tab" data-tab="functions" role="tab">Functions <span class="count" id="count-functions">0</span></button>
       <button type="button" class="tab" data-tab="coherence" role="tab">Coherence <span class="count" id="count-conflicts">0</span></button>
+      <button type="button" class="tab" data-tab="graph" role="tab">Call graph</button>
     </div>
 
     <div class="pane" id="pane-log"><pre id="log" class="log"></pre></div>
@@ -165,6 +166,30 @@
           </tr></thead>
           <tbody id="functions"></tbody>
         </table>
+      </div>
+    </div>
+
+    <div class="pane" id="pane-graph" hidden>
+      <div class="graph-bar">
+        <input type="search" id="graph-filter" class="filter" placeholder="Filter by name or address" disabled>
+        <button type="button" class="btn btn--ghost" id="graph-reload">Reload</button>
+      </div>
+      <p class="hint" id="graph-hint">Reading the call graph&hellip;</p>
+      <div class="graph" id="graph" hidden>
+        <ul class="graph-list" id="graph-list"></ul>
+        <div class="graph-main">
+          <div class="graph-detail" id="graph-detail"></div>
+          <div class="graph-canvas">
+            <svg id="graph-svg" role="img"
+                 aria-label="Callers and callees of the selected function"></svg>
+          </div>
+          <p class="graph-legend">
+            <span><i class="swatch swatch--hi"></i>confidence 80&thinsp;%+</span>
+            <span><i class="swatch swatch--md"></i>40–79&thinsp;%</span>
+            <span><i class="swatch swatch--lo"></i>under 40&thinsp;%, or never analyzed</span>
+            <span>Click a box to move to it.</span>
+          </p>
+        </div>
       </div>
     </div>
 

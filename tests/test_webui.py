@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import pathlib
+import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -15,6 +18,7 @@ from kong.webui.server import (
     KongSession,
     bootstrap_payload,
     browse,
+    call_graph,
     serve,
     settings_from_payload,
 )
@@ -379,3 +383,171 @@ class TestServer:
             _request(server, "/api/nope")
 
         assert caught.value.code == 404
+
+
+def _analysis_json(directory, *, edges, functions=None):
+    """Write the document the graph view reads."""
+    directory.mkdir(parents=True, exist_ok=True)
+    document = {
+        "binary": {"name": "FA18.exe", "arch": "x86", "format": "PE"},
+        "stats": {},
+        "functions": functions if functions is not None else [
+            {
+                "address": "0x00401000",
+                "original_name": "FUN_00401000",
+                "name": "game_tick",
+                "confidence": 85,
+                "classification": "handler",
+            },
+            {
+                "address": "0x00402000",
+                "original_name": "FUN_00402000",
+                "name": "draw_hud",
+                "confidence": 45,
+                "classification": "io",
+            },
+        ],
+        "failures": [],
+        "call_graph": {"edges": edges},
+    }
+    (directory / "analysis.json").write_text(json.dumps(document), encoding="utf-8")
+    return directory
+
+
+class TestCallGraphView:
+    """What the Call graph tab reads, and what it says when it cannot."""
+
+    def test_functions_and_edges_come_back(self, tmp_path):
+        out = _analysis_json(
+            tmp_path / "out", edges=[["0x00401000", "0x00402000"]]
+        )
+
+        graph = call_graph(str(out))
+
+        assert graph["ok"]
+        assert [node["n"] for node in graph["nodes"]] == ["game_tick", "draw_hud"]
+        assert graph["edges"] == [[0, 1]]
+        assert graph["binary"] == "FA18.exe"
+
+    def test_a_callee_nobody_analyzed_still_gets_a_node(self, tmp_path):
+        """The reason the graph is exported rather than parsed back out of the C.
+
+        A function no pass named does not appear in the recovered source, so a
+        graph rebuilt from that source loses every call into it — 297 of them
+        on the FA18 binary.
+        """
+        out = _analysis_json(
+            tmp_path / "out", edges=[["0x00401000", "0x0045f2c0"]]
+        )
+
+        graph = call_graph(str(out))
+
+        unanalyzed = [node for node in graph["nodes"] if node["u"]]
+        assert [node["a"] for node in unanalyzed] == ["0x0045f2c0"]
+        assert unanalyzed[0]["n"] == "FUN_0045f2c0"
+        assert graph["edges"] == [[0, 2]]
+
+    def test_an_analyzed_function_is_not_marked_unanalyzed(self, tmp_path):
+        out = _analysis_json(tmp_path / "out", edges=[["0x00401000", "0x00402000"]])
+
+        graph = call_graph(str(out))
+
+        assert [node["u"] for node in graph["nodes"]] == [False, False]
+
+    def test_no_output_directory_says_so(self):
+        answer = call_graph("")
+
+        assert not answer["ok"]
+        assert "Start a run" in answer["message"]
+
+    def test_a_directory_without_the_file_names_the_file(self, tmp_path):
+        answer = call_graph(str(tmp_path))
+
+        assert not answer["ok"]
+        assert "analysis.json" in answer["message"]
+
+    def test_an_analysis_from_before_the_graph_was_exported_says_to_re_export(
+        self, tmp_path,
+    ):
+        out = _analysis_json(tmp_path / "out", edges=[])
+
+        answer = call_graph(str(out))
+
+        assert not answer["ok"]
+        assert "re-export" in answer["message"]
+
+    def test_unreadable_json_is_reported_not_raised(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "analysis.json").write_text("{ not json", encoding="utf-8")
+
+        answer = call_graph(str(out))
+
+        assert not answer["ok"]
+        assert "Could not read" in answer["message"]
+
+    def test_a_malformed_edge_is_skipped_rather_than_breaking_the_view(self, tmp_path):
+        out = _analysis_json(
+            tmp_path / "out",
+            edges=[["0x00401000", "0x00402000"], ["zzz", "0x00402000"], ["0x1"]],
+        )
+
+        graph = call_graph(str(out))
+
+        assert graph["ok"]
+        assert graph["edges"] == [[0, 1]]
+
+
+class TestCallGraphOverHTTP:
+    def test_the_route_answers_json(self, server):
+        status, body = _request(server, "/api/graph")
+
+        assert status == 200
+        assert json.loads(body)["ok"] is False
+
+    def test_a_path_can_be_asked_for_directly(self, server, tmp_path):
+        out = _analysis_json(tmp_path / "out", edges=[["0x00401000", "0x00402000"]])
+
+        status, body = _request(
+            server, f"/api/graph?path={urllib.parse.quote(str(out))}"
+        )
+
+        assert status == 200
+        assert json.loads(body)["ok"] is True
+
+    def test_it_needs_the_token_like_every_other_api_call(self, server):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            _request(server, "/api/graph", token="not-the-token")
+
+        assert caught.value.code == 403
+
+
+class TestGraphMarkup:
+    """The tab and its pane have to agree, or the button shows an empty page."""
+
+    def _static(self, name):
+        from kong.webui import server as module
+
+        return (pathlib.Path(module.__file__).parent / "static" / name).read_text(
+            encoding="utf-8"
+        )
+
+    def test_every_tab_has_a_pane(self):
+        html = self._static("index.html")
+        tabs = set(re.findall(r'data-tab="([a-z]+)"', html))
+        panes = set(re.findall(r'id="pane-([a-z]+)"', html))
+
+        assert tabs == panes
+
+    def test_the_script_toggles_every_pane_the_page_has(self):
+        html = self._static("index.html")
+        js = self._static("app.js")
+        panes = set(re.findall(r'id="pane-([a-z]+)"', html))
+        listed = set(re.findall(r'"([a-z]+)"', re.search(
+            r"for \(const name of \[([^\]]+)\]\)", js
+        ).group(1)))
+
+        assert panes == listed
+
+    def test_the_graph_pane_is_there(self):
+        assert 'id="pane-graph"' in self._static("index.html")

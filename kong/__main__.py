@@ -1175,6 +1175,71 @@ def setup() -> None:
         )
 
 
+@cli.command(name="graph")
+@click.argument("output_dir", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--binary",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Read the edges from Ghidra instead of from decompiled.c. Exact, and "
+        "what a fresh run would write, but it needs the binary and takes as "
+        "long as loading the program."
+    ),
+)
+@click.option("--ghidra-dir", default=None, help="Ghidra installation directory.")
+def graph_cmd(output_dir: str, binary: str | None, ghidra_dir: str | None) -> None:
+    """Put a call graph into a finished analysis, without re-analyzing it.
+
+    The analysis is what a run paid the model for; the call graph is not — the
+    edges come from Ghidra and never from the model. An export written before
+    Kong saved the graph therefore needs only this, not the run again.
+
+    Without --binary the edges are read out of the decompiled.c beside the
+    document. That is free and needs nothing installed, but it sees only what
+    the decompiler printed: a call through a function pointer or a vtable has
+    no name in it and never becomes an edge. The document records which of the
+    two it was given.
+    """
+    from kong.export.callgraph import backfill
+
+    client = None
+    if binary:
+        install_dir = GhidraConfig(install_dir=ghidra_dir).install_dir
+        if not install_dir:
+            console.print("[red]Ghidra is not installed or not found.[/red]")
+            raise SystemExit(1)
+        try:
+            client = GhidraClient(
+                binary_path=str(Path(binary).resolve()), install_dir=install_dir
+            )
+            client.open()
+        except GhidraClientError as e:
+            console.print(f"[red]Failed to open binary:[/red] {e}")
+            raise SystemExit(1)
+
+    try:
+        result = backfill(Path(output_dir), client)
+    finally:
+        if client is not None:
+            client.close()
+
+    if not result["ok"]:
+        console.print(f"[red]{escape(result['message'])}[/red]")
+        raise SystemExit(1)
+
+    console.print(
+        f"[green]{result['edges']} call edges[/green] from "
+        f"[bold]{result['source']}[/bold] written to {escape(result['path'])}"
+    )
+    console.print(f"  [dim]it had {escape(result['before'])}[/dim]")
+    if result["source"] != "ghidra":
+        console.print(
+            "  [dim]Indirect calls are not in it: pass --binary to read the "
+            "edges from Ghidra instead.[/dim]"
+        )
+
+
 @cli.command(name="eval")
 @click.argument("analysis_json", type=click.Path(exists=True, dir_okay=False))
 @click.argument("source_file", type=click.Path(exists=True, dir_okay=False))

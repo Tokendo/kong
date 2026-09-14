@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import os
+import re
 
 import pytest
 from click.testing import CliRunner
@@ -843,5 +844,7 @@ class TestTranspileSelectionGuards:
         ])
 
         assert result.exit_code == 1
-        # rich hard-wraps the console, so compare on normalised whitespace.
-        assert "no translation was asked for" in " ".join(result.output.split())
+        # rich hard-wraps the console and colours it when FORCE_COLOR is set,
+        # so compare on plain text with the whitespace normalised.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "no translation was asked for" in " ".join(plain.split())

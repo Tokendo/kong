@@ -37,6 +37,9 @@ const ui = {
   waitStamp: 0,
   waiting: false,
   running: false,
+  graph: null,          // nodes, edges and the adjacency built from them
+  graphFocus: 0,
+  graphAsked: false,    // the tab reads the file once, then on Reload
 };
 
 /* ----------------------------------------------------------------- plumbing */
@@ -423,6 +426,288 @@ async function poll() {
 
 /* ------------------------------------------------------------------- picker */
 
+/* ------------------------------------------------------------- call graph */
+
+/* The graph is read from analysis.json rather than from the running job: that
+   is where it is complete, and a page opened long after the run gets the same
+   answer as one that watched it. */
+
+const GRAPH_NEIGHBOURS = 9;
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svgEl = (name, attrs) => {
+  const node = document.createElementNS(SVG_NS, name);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    node.setAttribute(key, value);
+  }
+  return node;
+};
+
+function confidenceClass(node) {
+  if (node.u || node.q < 40) return "lo";
+  return node.q >= 80 ? "hi" : "md";
+}
+
+function confidenceInk(node) {
+  return { hi: "#26bfb5", md: "rgba(255,255,255,.68)", lo: "#ff5772" }[
+    confidenceClass(node)
+  ];
+}
+
+async function loadGraph() {
+  ui.graphAsked = true;
+  $("graph-hint").hidden = false;
+  $("graph-hint").textContent = "Reading the call graph\u2026";
+  $("graph").hidden = true;
+
+  // The output directory on the form, not just the running job's: the common
+  // case is reopening the page to read a graph a finished run left on disk.
+  const where = $("output").value.trim();
+  let payload;
+  try {
+    payload = await api(
+      where ? `/api/graph?path=${encodeURIComponent(where)}` : "/api/graph"
+    );
+  } catch (error) {
+    $("graph-hint").textContent = String(error.message || error);
+    return;
+  }
+
+  if (!payload.ok) {
+    $("graph-hint").textContent = payload.message || "No call graph to show.";
+    $("graph-filter").disabled = true;
+    ui.graph = null;
+    return;
+  }
+
+  const callers = payload.nodes.map(() => []);
+  const callees = payload.nodes.map(() => []);
+  for (const [from, to] of payload.edges) {
+    callees[from].push(to);
+    callers[to].push(from);
+  }
+  ui.graph = { ...payload, callers, callees };
+
+  $("graph-filter").disabled = false;
+  $("graph-hint").hidden = true;
+  $("graph").hidden = false;
+
+  // Open on the busiest function: the one place the shape of the program shows.
+  let best = 0;
+  for (let i = 0; i < payload.nodes.length; i += 1) {
+    if (callers[i].length + callees[i].length >
+        callers[best].length + callees[best].length) {
+      best = i;
+    }
+  }
+  focusNode(best);   // renders the list itself
+}
+
+function graphMatches() {
+  const needle = $("graph-filter").value.trim().toLowerCase();
+  const { nodes, callers, callees } = ui.graph;
+  const kept = [];
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (!needle
+        || nodes[i].n.toLowerCase().includes(needle)
+        || nodes[i].a.includes(needle)) {
+      kept.push(i);
+    }
+  }
+  kept.sort((a, b) =>
+    (callers[b].length + callees[b].length) - (callers[a].length + callees[a].length)
+  );
+  return kept;
+}
+
+function renderGraphList() {
+  if (!ui.graph) return;
+  const list = $("graph-list");
+  const { nodes, callers, callees } = ui.graph;
+  const kept = graphMatches();
+  const shown = kept.slice(0, 300);
+
+  list.textContent = "";
+  for (const i of shown) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "graph-item";
+    if (i === ui.graphFocus) button.setAttribute("aria-current", "true");
+
+    const name = document.createElement("span");
+    name.className = `graph-item-name q-${confidenceClass(nodes[i])}`;
+    name.textContent = nodes[i].n;
+
+    const meta = document.createElement("span");
+    meta.className = "graph-item-meta";
+    meta.textContent =
+      `${nodes[i].a} \u00b7 ${callers[i].length}\u2191 ${callees[i].length}\u2193`
+      + (nodes[i].u ? " \u00b7 not analyzed" : ` \u00b7 ${nodes[i].q}%`);
+
+    button.append(name, meta);
+    button.addEventListener("click", () => focusNode(i));
+    item.append(button);
+    list.append(item);
+  }
+
+  if (kept.length > shown.length) {
+    const rest = document.createElement("li");
+    rest.className = "graph-more";
+    rest.textContent = `${kept.length - shown.length} more \u2014 narrow the filter.`;
+    list.append(rest);
+  }
+  if (!kept.length) {
+    const none = document.createElement("li");
+    none.className = "graph-more";
+    none.textContent = "Nothing matches that.";
+    list.append(none);
+  }
+}
+
+function focusNode(index) {
+  ui.graphFocus = index;
+  renderGraphDetail();
+  drawGraph();
+  renderGraphList();
+}
+
+function renderGraphDetail() {
+  const { nodes, callers, callees } = ui.graph;
+  const node = nodes[ui.graphFocus];
+  const detail = $("graph-detail");
+  detail.textContent = "";
+
+  const title = document.createElement("h3");
+  title.className = "graph-title";
+  title.textContent = node.n;
+
+  const meta = document.createElement("p");
+  meta.className = "graph-meta";
+  const bits = [node.a];
+  if (node.c) bits.push(node.c);
+  bits.push(node.u
+    ? "never analyzed"
+    : `confidence ${node.q}%`);
+  bits.push(`${plural(callers[ui.graphFocus].length, "caller")}`);
+  bits.push(`${plural(callees[ui.graphFocus].length, "callee")}`);
+  meta.textContent = bits.join(" \u00b7 ");
+
+  detail.append(title, meta);
+}
+
+function drawGraph() {
+  const svg = $("graph-svg");
+  const { nodes, callers, callees } = ui.graph;
+  const focus = ui.graphFocus;
+  svg.textContent = "";
+
+  const BOX_W = 188;
+  const BOX_H = 42;
+  const GAP = 14;
+  const ROW = 116;
+
+  const up = callers[focus].slice(0, GRAPH_NEIGHBOURS);
+  const down = callees[focus].slice(0, GRAPH_NEIGHBOURS);
+  const columns = Math.max(up.length, down.length, 1);
+  const width = Math.max(columns * (BOX_W + GAP) + GAP, 520);
+  const height = ROW * 2 + BOX_H + 52;
+
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+
+  const rowY = (which) => (which === "up" ? 24 : which === "self" ? 24 + ROW : 24 + ROW * 2);
+  const place = (list, which) => {
+    const span = list.length * BOX_W + (list.length - 1) * GAP;
+    const left = (width - span) / 2;
+    return list.map((index, position) => ({
+      index, x: left + position * (BOX_W + GAP), y: rowY(which),
+    }));
+  };
+
+  const upBoxes = place(up, "up");
+  const downBoxes = place(down, "down");
+  const self = { index: focus, x: (width - BOX_W) / 2, y: rowY("self") };
+
+  const link = (from, to) => {
+    const x1 = from.x + BOX_W / 2;
+    const y1 = from.y + BOX_H;
+    const x2 = to.x + BOX_W / 2;
+    const y2 = to.y;
+    const mid = (y1 + y2) / 2;
+    svg.append(svgEl("path", {
+      d: `M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}`,
+      fill: "none", stroke: "rgba(255,255,255,.28)", "stroke-width": "1.2",
+    }));
+  };
+  upBoxes.forEach((box) => link(box, self));
+  downBoxes.forEach((box) => link(self, box));
+
+  const box = (spot, isSelf) => {
+    const node = nodes[spot.index];
+    const group = svgEl("g", { class: "graph-node" });
+    if (!isSelf) {
+      group.setAttribute("tabindex", "0");
+      group.setAttribute("role", "button");
+    }
+    group.append(svgEl("rect", {
+      x: spot.x, y: spot.y, width: BOX_W, height: BOX_H, rx: 6,
+      fill: isSelf ? "#14425f" : "#0f3550",
+      stroke: isSelf ? "#26bfb5" : "rgba(255,255,255,.28)",
+      "stroke-width": isSelf ? "2" : "1",
+    }));
+
+    // The monospace face is set in the stylesheet: a presentation attribute
+    // does not resolve a custom property.
+    const label = svgEl("text", {
+      class: "graph-node-name",
+      x: spot.x + 10, y: spot.y + 18, fill: confidenceInk(node),
+      "font-size": "12",
+    });
+    label.textContent = node.n.length > 25 ? `${node.n.slice(0, 24)}\u2026` : node.n;
+
+    const under = svgEl("text", {
+      x: spot.x + 10, y: spot.y + 33,
+      fill: "rgba(255,255,255,.45)", "font-size": "10.5",
+    });
+    under.textContent = node.u
+      ? `${node.a} \u00b7 not analyzed`
+      : [node.a, node.c].filter(Boolean).join(" \u00b7 ");
+
+    const tip = svgEl("title");
+    tip.textContent = node.u ? `${node.n} — never analyzed` : `${node.n} — ${node.q}%`;
+
+    group.append(label, under, tip);
+    if (!isSelf) {
+      group.addEventListener("click", () => focusNode(spot.index));
+      group.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          focusNode(spot.index);
+        }
+      });
+    }
+    svg.append(group);
+  };
+
+  upBoxes.forEach((spot) => box(spot, false));
+  box(self, true);
+  downBoxes.forEach((spot) => box(spot, false));
+
+  const caption = (text, y) => {
+    const node = svgEl("text", {
+      x: 10, y, fill: "rgba(255,255,255,.45)",
+      "font-size": "10.5", "letter-spacing": "1.1",
+    });
+    node.textContent = text;
+    svg.append(node);
+  };
+  const more = (count) =>
+    count > GRAPH_NEIGHBOURS ? ` (${GRAPH_NEIGHBOURS} shown)` : "";
+  caption(`CALLERS ${callers[focus].length}${more(callers[focus].length)}`, 15);
+  caption(`CALLEES ${callees[focus].length}${more(callees[focus].length)}`, rowY("down") - 9);
+}
+
 const picker = {
   target: null,
   mode: "file",
@@ -585,14 +870,20 @@ function wire() {
     }
   });
 
+  $("graph-reload").addEventListener("click", loadGraph);
+  $("graph-filter").addEventListener("input", renderGraphList);
+
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => {
       for (const other of document.querySelectorAll(".tab")) {
         other.classList.toggle("tab--on", other === tab);
       }
-      for (const name of ["log", "functions", "coherence"]) {
+      for (const name of ["log", "functions", "coherence", "graph"]) {
         $(`pane-${name}`).hidden = name !== tab.dataset.tab;
       }
+      // Read on first open rather than on every run: the file is only written
+      // at export, and it can be a few hundred kilobytes.
+      if (tab.dataset.tab === "graph" && !ui.graphAsked) loadGraph();
     });
   }
 }

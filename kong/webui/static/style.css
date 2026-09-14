@@ -518,3 +518,119 @@ input::placeholder { color: var(--text-faint); font-weight: var(--fw-light); }
   .pill { max-width: 100%; }
   .topbar { flex-wrap: wrap; }
 }
+
+/* ----------------------------------------------------------- call graph */
+/* A whole binary at once is a hairball nobody can read, so the view is one
+   function's neighbourhood: who calls it above, what it calls below, and a
+   click to walk. Confidence is the only thing colour encodes — it is what
+   decides whether a name here can be trusted. */
+
+.graph-bar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.graph-bar .filter { margin-bottom: 0; flex: 1; }
+
+.graph {
+  display: grid;
+  grid-template-columns: minmax(0, 280px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.graph-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 460px;
+  overflow-y: auto;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.graph-list li + li { border-top: 1px solid var(--border); }
+
+.graph-item {
+  width: 100%;
+  display: block;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.graph-item:hover { background: var(--surface-2); }
+.graph-item[aria-current="true"] {
+  background: var(--surface-2);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.graph-item-name {
+  display: block;
+  font-family: var(--mono);
+  font-size: .82rem;
+  word-break: break-word;
+}
+.graph-item-meta {
+  display: block;
+  font-size: .7rem;
+  color: var(--text-faint);
+}
+.graph-more {
+  padding: 8px 12px;
+  font-size: .78rem;
+  color: var(--text-faint);
+}
+
+.q-hi { color: var(--accent); }
+.q-md { color: var(--text-muted); }
+.q-lo { color: var(--alert); }
+
+.graph-main {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+.graph-detail { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.graph-title {
+  margin: 0 0 4px;
+  font-family: var(--mono);
+  font-size: 1rem;
+  font-weight: var(--fw-medium);
+  word-break: break-word;
+}
+.graph-meta { margin: 0; font-size: .8rem; color: var(--text-muted); }
+
+/* The drawing is the one thing allowed to run wider than the pane. */
+.graph-canvas { overflow-x: auto; background: var(--bg-deep); }
+#graph-svg { display: block; }
+#graph-svg text { font-family: var(--font); }
+#graph-svg .graph-node-name { font-family: var(--mono); }
+.graph-node { cursor: pointer; }
+.graph-node:hover rect { fill: var(--surface-2); }
+.graph-node:focus-visible rect { stroke: var(--accent); stroke-width: 2; }
+
+.graph-legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 9px 16px;
+  border-top: 1px solid var(--border);
+  font-size: .74rem;
+  color: var(--text-faint);
+}
+.graph-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.swatch--hi { background: var(--accent); }
+.swatch--md { background: rgba(255, 255, 255, .68); }
+.swatch--lo { background: var(--alert); }
+
+@media (max-width: 900px) {
+  .graph { grid-template-columns: 1fr; }
+  .graph-list { max-height: 240px; }
+}

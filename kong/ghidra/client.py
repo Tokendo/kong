@@ -240,24 +240,53 @@ class GhidraClient:
         ]
 
     def get_callers(self, addr: int) -> list[int]:
-        """Get addresses of functions that call the function at addr."""
-        target = self._to_addr(addr)
-        refs = self.flat_api.getReferencesTo(target)
-        return list({
-            int(ref.getFromAddress().getOffset())
-            for ref in refs
-            if ref.getReferenceType().isCall()
-        })
+        """Entry points of the functions that call the function at *addr*.
+
+        A call reference points at the instruction that makes the call, not at
+        the function holding it, so the raw reference has to be resolved back
+        to its function: returning the call site instead gave addresses in the
+        middle of functions, which match nothing in a call graph keyed by entry
+        point.
+        """
+        manager = self.program.getReferenceManager()
+        functions = self.program.getFunctionManager()
+        callers: set[int] = set()
+        for ref in manager.getReferencesTo(self._to_addr(addr)):
+            if not ref.getReferenceType().isCall():
+                continue
+            calling = functions.getFunctionContaining(ref.getFromAddress())
+            if calling is not None:
+                callers.add(int(calling.getEntryPoint().getOffset()))
+        return sorted(callers)
 
     def get_callees(self, addr: int) -> list[int]:
-        """Get addresses of functions called by the function at addr."""
-        source = self._to_addr(addr)
-        refs = self.program.getReferenceManager().getReferencesFrom(source)
-        return list({
-            int(ref.getToAddress().getOffset())
-            for ref in refs
-            if ref.getReferenceType().isCall()
-        })
+        """Entry points of the functions called from anywhere inside *addr*.
+
+        The whole body, not the entry point: `getReferencesFrom(entry)` reads
+        the references leaving one address, so it only ever found a callee when
+        a function happened to open on a call. On a 1494-function binary that
+        produced fourteen edges, and the bottom-up work queue that is ordered
+        from this graph was ordering nothing.
+
+        A call whose target is not a function — a computed jump, a bad
+        reference — is dropped rather than exported as an edge to an address no
+        function occupies.
+        """
+        functions = self.program.getFunctionManager()
+        function = functions.getFunctionAt(self._to_addr(addr))
+        if function is None:
+            return []
+
+        manager = self.program.getReferenceManager()
+        callees: set[int] = set()
+        for source in manager.getReferenceSourceIterator(function.getBody(), True):
+            for ref in manager.getReferencesFrom(source):
+                if not ref.getReferenceType().isCall():
+                    continue
+                called = functions.getFunctionAt(ref.getToAddress())
+                if called is not None:
+                    callees.add(int(called.getEntryPoint().getOffset()))
+        return sorted(callees)
 
     def get_strings(self) -> list[StringEntry]:
         """Get all defined strings in the binary."""

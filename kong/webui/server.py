@@ -183,6 +183,11 @@ class KongSession:
         self._conflicts: dict[str, dict[str, Any]] = {}
         self._conflicts_version = 0
 
+    def output_directory(self) -> str:
+        """Where this session's run writes, when it has one."""
+        controller = self.controller
+        return controller.settings.output_dir if controller is not None else ""
+
     # ----------------------------------------------------------------- events
 
     def _append_log(self, tag: str, message: str, kind: str) -> None:
@@ -407,6 +412,103 @@ def bootstrap_payload(session: KongSession) -> dict[str, Any]:
     }
 
 
+#: Nodes the graph view will accept. A binary an order of magnitude past this
+#: is not a thing to draw, and the browser should say so rather than freeze.
+GRAPH_NODE_LIMIT = 6000
+
+
+def call_graph(output_dir: str) -> dict[str, Any]:
+    """Read a finished run's call graph back out of analysis.json.
+
+    The graph is served from the file rather than from the live run because
+    that is where it is complete: it is written at export, and a page reopened
+    days later gets the same answer as one watching the run that produced it.
+
+    Edges are index pairs into `nodes`, and an address that only ever appears
+    as a callee still gets a node. That is the case the file exists for: a
+    function no pass analyzed is invisible in the recovered C, so a graph built
+    by parsing that C back loses every call into it.
+    """
+    if not output_dir:
+        return {"ok": False, "message": "No output directory yet. Start a run first."}
+
+    path = Path(output_dir).expanduser() / "analysis.json"
+    if not path.is_file():
+        return {
+            "ok": False,
+            "message": (
+                f"{path} is not there yet. Export writes it, at the end of a run "
+                f"or from Export now."
+            ),
+        }
+
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return {"ok": False, "message": f"Could not read {path}: {exc}"}
+
+    raw_edges = (document.get("call_graph") or {}).get("edges") or []
+    functions = document.get("functions") or []
+
+    def address_of(text: object) -> int | None:
+        try:
+            return int(str(text), 16)
+        except (TypeError, ValueError):
+            return None
+
+    nodes: list[dict[str, Any]] = []
+    index: dict[int, int] = {}
+
+    def node_for(address: int, entry: dict[str, Any] | None = None) -> int:
+        position = index.get(address)
+        if position is not None:
+            return position
+        index[address] = len(nodes)
+        nodes.append({
+            "a": f"0x{address:08x}",
+            "n": (entry or {}).get("name") or f"FUN_{address:08x}",
+            "c": (entry or {}).get("classification") or "",
+            "q": (entry or {}).get("confidence", 0) if entry else 0,
+            "u": entry is None,  # never analyzed: it is only a callee
+        })
+        return index[address]
+
+    for entry in functions:
+        address = address_of(entry.get("address"))
+        if address is not None:
+            node_for(address, entry)
+
+    edges: list[list[int]] = []
+    for pair in raw_edges:
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        caller, callee = address_of(pair[0]), address_of(pair[1])
+        if caller is None or callee is None:
+            continue
+        if len(nodes) >= GRAPH_NODE_LIMIT and (
+            caller not in index or callee not in index
+        ):
+            continue
+        edges.append([node_for(caller), node_for(callee)])
+
+    if not edges:
+        return {
+            "ok": False,
+            "message": (
+                "This analysis.json carries no call graph. It was written by a "
+                "version that did not save one — re-export to add it."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "binary": (document.get("binary") or {}).get("name", ""),
+        "path": str(path),
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
 def browse(path: str = "") -> dict[str, Any]:
     """List a directory, for the picker a browser cannot open by itself."""
     target = Path(path).expanduser() if path else Path.cwd()
@@ -594,6 +696,9 @@ class _Handler(BaseHTTPRequestHandler):
             )
         elif route == "/api/browse":
             self._send_json(browse((query.get("path") or [""])[0]))
+        elif route == "/api/graph":
+            asked = (query.get("path") or [""])[0]
+            self._send_json(call_graph(asked or self.session.output_directory()))
         else:
             self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 

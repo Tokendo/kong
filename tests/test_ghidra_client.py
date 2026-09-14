@@ -240,18 +240,124 @@ class TestXRefs:
         assert xrefs[0].from_addr == 0x401050
         assert xrefs[0].ref_type == "UNCONDITIONAL_CALL"
 
-    def test_get_callers(self, client):
-        refs = []
-        for from_addr in [0x401050, 0x401100]:
-            ref = MagicMock()
-            ref.getFromAddress.return_value = _mock_address(from_addr)
-            ref.getReferenceType.return_value.isCall.return_value = True
-            refs.append(ref)
-        client.flat_api.getReferencesTo.return_value = refs
 
-        callers = client.get_callers(0x401000)
-        assert 0x401050 in callers
-        assert 0x401100 in callers
+def _call_ref(from_addr, to_addr=0, is_call=True):
+    ref = MagicMock()
+    ref.getFromAddress.return_value = _mock_address(from_addr)
+    ref.getToAddress.return_value = _mock_address(to_addr)
+    ref.getReferenceType.return_value.isCall.return_value = is_call
+    return ref
+
+
+def _wire_xrefs(client, *, refs_to=(), refs_from=None, containing=None, at=None):
+    """Point the program's reference and function managers at canned answers.
+
+    `containing` maps a call-site address to the entry point of the function
+    holding it; `at` maps an address to the function starting there.
+    """
+    manager = MagicMock()
+    manager.getReferencesTo.return_value = list(refs_to)
+    manager.getReferencesFrom.side_effect = lambda address: list(
+        (refs_from or {}).get(address.getOffset(), [])
+    )
+    manager.getReferenceSourceIterator.side_effect = lambda body, forward: [
+        _mock_address(offset) for offset in sorted(refs_from or {})
+    ]
+    client.program.getReferenceManager.return_value = manager
+
+    functions = MagicMock()
+    functions.getFunctionContaining.side_effect = lambda address: (
+        _mock_function((containing or {})[address.getOffset()], "caller", 100)
+        if address.getOffset() in (containing or {}) else None
+    )
+    functions.getFunctionAt.side_effect = lambda address: (
+        _mock_function((at or {})[address.getOffset()], "callee", 100)
+        if address.getOffset() in (at or {}) else None
+    )
+    client.program.getFunctionManager.return_value = functions
+    return manager, functions
+
+
+class TestCallGraphEdges:
+    """A call graph is keyed by entry point, so both ends have to be resolved.
+
+    get_callers returned the address of the call instruction, which sits in the
+    middle of a function and matches nothing; get_callees read the references
+    leaving the entry point alone, so it only ever found a callee when a
+    function opened on a call. On a 1494-function binary that was 14 edges.
+    """
+
+    def test_a_call_site_resolves_to_the_function_holding_it(self, client):
+        _wire_xrefs(
+            client,
+            refs_to=[_call_ref(0x401050), _call_ref(0x402080)],
+            containing={0x401050: 0x401000, 0x402080: 0x402000},
+        )
+
+        assert client.get_callers(0x403000) == [0x401000, 0x402000]
+
+    def test_two_call_sites_in_one_function_are_one_caller(self, client):
+        _wire_xrefs(
+            client,
+            refs_to=[_call_ref(0x401050), _call_ref(0x401090)],
+            containing={0x401050: 0x401000, 0x401090: 0x401000},
+        )
+
+        assert client.get_callers(0x403000) == [0x401000]
+
+    def test_a_call_site_outside_any_function_is_dropped(self, client):
+        _wire_xrefs(client, refs_to=[_call_ref(0x401050)], containing={})
+
+        assert client.get_callers(0x403000) == []
+
+    def test_a_reference_that_is_not_a_call_is_ignored(self, client):
+        _wire_xrefs(
+            client,
+            refs_to=[_call_ref(0x401050, is_call=False)],
+            containing={0x401050: 0x401000},
+        )
+
+        assert client.get_callers(0x403000) == []
+
+    def test_callees_are_read_from_the_whole_body(self, client):
+        """The bug in one line: a call at 0x401040 is not at the entry point."""
+        _wire_xrefs(
+            client,
+            refs_from={
+                0x401040: [_call_ref(0x401040, 0x402000)],
+                0x401060: [_call_ref(0x401060, 0x403000)],
+            },
+            at={0x401000: 0x401000, 0x402000: 0x402000, 0x403000: 0x403000},
+        )
+
+        assert client.get_callees(0x401000) == [0x402000, 0x403000]
+
+    def test_a_call_to_something_that_is_not_a_function_is_dropped(self, client):
+        """The 0x0000008f edges a computed jump used to put in the graph."""
+        _wire_xrefs(
+            client,
+            refs_from={0x401040: [_call_ref(0x401040, 0x8F)]},
+            at={0x401000: 0x401000},
+        )
+
+        assert client.get_callees(0x401000) == []
+
+    def test_an_address_that_is_not_a_function_has_no_callees(self, client):
+        _wire_xrefs(client, refs_from={}, at={})
+
+        assert client.get_callees(0x401000) == []
+
+    def test_the_same_callee_twice_is_one_edge(self, client):
+        _wire_xrefs(
+            client,
+            refs_from={
+                0x401040: [_call_ref(0x401040, 0x402000)],
+                0x401060: [_call_ref(0x401060, 0x402000)],
+            },
+            at={0x401000: 0x401000, 0x402000: 0x402000},
+        )
+
+        assert client.get_callees(0x401000) == [0x402000]
 
 
 class TestMutations:
