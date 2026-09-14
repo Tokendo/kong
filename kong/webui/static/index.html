@@ -41,6 +41,11 @@
         <input type="text" id="output" spellcheck="false">
         <button type="button" class="btn btn--ghost" data-browse="output" data-mode="dir">Browse</button>
       </div>
+      <button type="button" class="btn btn--quiet" id="open-existing">Open without analyzing</button>
+      <p class="hint">Loads a previous run's functions and call graph for
+        browsing. No Ghidra, no model calls, and nothing is redone —
+        unlike Analyze, which redoes cleanup, synthesis and export even when
+        every function resumes.</p>
 
       <span class="field">Formats</span>
       <div class="chips" id="formats"></div>

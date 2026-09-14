@@ -1064,7 +1064,7 @@ class TestDecompilationCacheInvalidation:
 class TestResume:
     """A run checkpoints itself so the next one need not pay twice."""
 
-    def _run(self, tmp_path, resume=False, functions=None):
+    def _run(self, tmp_path, resume=False, functions=None, events=None):
         funcs = functions or [_func(0x1000, "FUN_00001000", size=64)]
         client = _make_client(functions=funcs)
         client.get_decompilation.return_value = "void f(void) { return; }"
@@ -1083,6 +1083,8 @@ class TestResume:
             output=OutputConfig(directory=tmp_path / "out"), resume=resume,
         )
         sup = Supervisor(client, config, llm_client=mock_llm)
+        if events is not None:
+            sup.on_event(events.append)
         sup.run()
         return sup, mock_llm
 
@@ -1135,6 +1137,55 @@ class TestResume:
 
         assert llm.analyze_function_batch.call_count == 1
         assert sup.results[0x1000].name
+
+    def test_a_full_resume_skips_cleanup_synthesis_and_export(self, tmp_path):
+        """Reopening a finished run should not pay for a full resynthesis.
+
+        Every function comes back from the checkpoint unchanged, so cleanup,
+        synthesis and export would only reproduce what is already on disk.
+        """
+        self._run(tmp_path)
+        exported = tmp_path / "out" / "decompiled.c"
+        assert exported.exists()
+        exported.write_text("stale, should not be touched")
+
+        events = []
+        second, second_llm = self._run(tmp_path, resume=True, events=events)
+
+        assert second_llm.analyze_function_batch.call_count == 0
+        assert second_llm.analyze_function.call_count == 0  # no synthesis call
+        assert exported.read_text() == "stale, should not be touched"
+
+        skip_messages = [
+            e.message for e in events
+            if e.type == EventType.PHASE_COMPLETE and "Nothing new" in e.message
+        ]
+        assert skip_messages
+        assert not any(
+            e.type == EventType.PHASE_START and e.phase == Phase.SYNTHESIS
+            for e in events
+        )
+
+    def test_a_resume_with_something_new_still_synthesizes_and_exports(
+        self, tmp_path,
+    ):
+        self._run(tmp_path)
+        exported = tmp_path / "out" / "decompiled.c"
+        exported.write_text("stale, should be overwritten")
+
+        second_funcs = [
+            _func(0x1000, "FUN_00001000", size=64),
+            _func(0x2000, "FUN_00002000", size=64),
+        ]
+        events = []
+        second, second_llm = self._run(
+            tmp_path, resume=True, functions=second_funcs, events=events,
+        )
+
+        assert second_llm.analyze_function_batch.call_count == 1
+        assert second_llm.analyze_function.call_count == 1  # synthesis ran
+        assert exported.read_text() != "stale, should be overwritten"
+        assert not any("Nothing new" in e.message for e in events)
 
     def test_an_unwritable_state_directory_does_not_kill_the_run(
         self, tmp_path, monkeypatch,
@@ -1493,6 +1544,47 @@ class TestTwoPassAnalysis:
         assert result.refined
         assert result.name == "parse_http_header"
         assert llm.analyze_function_batch.call_count == 0
+
+    def test_a_refined_function_stays_refined_across_further_resumes(self, tmp_path):
+        """The strong model's answer is not redone every time the run reopens.
+
+        `refined` is part of the saved state (kong/state/persistence.py), so a
+        function the second pass already handled is restored as such and never
+        re-enters `_pending_refinement` — this is what makes reopening a
+        finished analysis cheap, not just this run's synthesis skip.
+        """
+        from kong.state.persistence import save_state
+
+        save_state(
+            {0x1000: FunctionResult(
+                address=0x1000, original_name="FUN_1000", name="draft_0",
+                confidence=30, model=self.DRAFT, llm_calls=1,
+            )},
+            tmp_path / "out",
+        )
+        config = KongConfig(
+            llm=LLMConfig(model=self.STRONG),
+            output=OutputConfig(directory=tmp_path / "out"),
+            resume=True,
+        )
+        client = _make_client(functions=[_func(0x1000, "FUN_1000", size=64)])
+        client.get_decompilation.return_value = "void f(void) { return; }"
+        first = Supervisor(client, config, llm_client=self._llm())
+        first.run()
+        assert first.results[0x1000].refined
+
+        client2 = _make_client(functions=[_func(0x1000, "FUN_1000", size=64)])
+        client2.get_decompilation.return_value = "void f(void) { return; }"
+        llm2 = self._llm()
+        second = Supervisor(client2, config, llm_client=llm2)
+        second.run()
+
+        assert second.results[0x1000].refined
+        assert second.results[0x1000].name == "parse_http_header"
+        # analyze_function serves both the second pass and synthesis: zero
+        # calls means neither redid anything over an already-refined result.
+        assert llm2.analyze_function.call_count == 0
+        assert llm2.analyze_function_batch.call_count == 0
 
     def test_limits_follow_the_model_of_the_pass(self, tmp_path):
         sup = Supervisor(_make_client(), self._config(tmp_path), llm_client=self._llm())

@@ -159,6 +159,9 @@ class Supervisor:
         self._coherence_lock = threading.Lock()
         # Same for the finishing pass, which a window offers as a button.
         self._finish_lock = threading.Lock()
+        # Same again for analyzing one function on demand, from a graph node
+        # clicked in the window.
+        self._function_lock = threading.Lock()
         self._binary_identity: BinaryIdentity | None = None
         self._identity_resolved = False
 
@@ -411,6 +414,120 @@ class Supervisor:
             return improved
         finally:
             self._finish_lock.release()
+
+    # ------------------------------------------------------------- on demand
+
+    def analyze_function(self, address: int) -> None:
+        """Re-run one function through the primary model, picked by hand.
+
+        For a caller outside the run loop — a graph node clicked in the
+        window — asking for one function regardless of its confidence or
+        refinement state. Uses the same per-function path as the second pass:
+        callers, callees, cross-references, strings, one call. Only Ghidra and
+        the in-memory result are touched; unlike the finishing pass this does
+        not re-export, since redoing cleanup and synthesis for every function
+        someone points at would cost far more than the call itself.
+        """
+        if not self._function_lock.acquire(blocking=False):
+            logger.info(
+                "A requested function analysis is already running; ignoring "
+                "this one."
+            )
+            return
+        try:
+            self._analyze_one(address)
+        finally:
+            self._function_lock.release()
+
+    def _analyze_one(self, address: int) -> None:
+        if self.llm_client is None:
+            self._emit(Event(
+                type=EventType.FUNCTION_ERROR,
+                phase=Phase.ANALYSIS,
+                message=f"Cannot analyze 0x{address:08x}: this run has no model.",
+                data={"address": address, "error": "no model"},
+            ))
+            return
+        if not self._program_is_open():
+            self._emit(Event(
+                type=EventType.FUNCTION_ERROR,
+                phase=Phase.ANALYSIS,
+                message=(
+                    f"Cannot analyze 0x{address:08x}: the binary is closed in "
+                    f"Ghidra. Analyze it again to reopen the program."
+                ),
+                data={"address": address, "error": "program closed"},
+            ))
+            return
+
+        item = self.queue.get_by_address(address)
+        if item is None:
+            self._emit(Event(
+                type=EventType.FUNCTION_ERROR,
+                phase=Phase.ANALYSIS,
+                message=f"0x{address:08x} is not a function this run knows about.",
+                data={"address": address, "error": "unknown address"},
+            ))
+            return
+
+        self._wait_if_paused()
+        func = item.function
+        previous = self.results.get(func.address)
+        best_name = (previous.name if previous else "") or func.name
+        self._invalidate_decompilation([address])
+
+        self._emit(Event(
+            type=EventType.FUNCTION_START,
+            phase=Phase.ANALYSIS,
+            message=(
+                f"Analyzing {best_name} ({func.address_hex}), requested by "
+                f"hand..."
+            ),
+            data={
+                "address": func.address,
+                "name": best_name,
+                "size": func.size,
+                "depth": item.depth,
+                "model": self._primary_model,
+            },
+        ))
+
+        try:
+            result = self._analyze_function_sequential(item)
+        except Exception as e:
+            err_msg = _clean_api_error(e)
+            logger.exception(
+                "Requested analysis of %s (%s) failed", func.name, func.address_hex,
+            )
+            self._emit(Event(
+                type=EventType.FUNCTION_ERROR,
+                phase=Phase.ANALYSIS,
+                message=f"Analysis of {func.name} failed: {err_msg}",
+                data={"address": func.address, "error": err_msg},
+            ))
+            return
+
+        if result.error or not result.name:
+            kept = "; keeping the previous answer." if previous else "."
+            self._emit(Event(
+                type=EventType.FUNCTION_ERROR,
+                phase=Phase.ANALYSIS,
+                message=f"Analysis of {func.name} produced nothing usable{kept}",
+                data={
+                    "address": func.address,
+                    "error": result.error or "Empty name in response",
+                },
+            ))
+            if previous is None:
+                self._record_analysis_result(func, result)
+            return
+
+        result.refined = True
+        result.llm_calls += previous.llm_calls if previous else 0
+        self._replace_analysis_result(func, result)
+        self._pending_refinement.discard(func.address)
+        self._deferred.pop(func.address, None)
+        self.checkpoint()
 
     # -------------------------------------------------------------- coherence
 
@@ -798,15 +915,39 @@ class Supervisor:
                 self._run_triage()
                 if stage is RunStage.FINISH:
                     self._run_finish_stage()
+                    full_resume = False
                 else:
-                    self._run_analysis()
-                self._run_cleanup()
-                # Synthesis unifies naming across the whole binary in one
-                # call. Spending it on draft output would only buy an answer
-                # the finishing pass invalidates, so a draft run leaves it.
-                if stage is not RunStage.DRAFT:
-                    self._run_synthesis()
-                self._run_export()
+                    restored, fresh = self._run_analysis()
+                    # Restored something, and did not need to touch any of
+                    # it: this run has nothing cleanup, synthesis or export
+                    # would not just redo byte-for-byte. Skipping them is
+                    # what makes reopening a finished run inside the window
+                    # (rather than the read-only viewer) cheap enough to
+                    # offer at all — synthesis alone is the run's single
+                    # most expensive phase.
+                    full_resume = restored > 0 and fresh == 0
+
+                if full_resume:
+                    self._emit(Event(
+                        type=EventType.PHASE_COMPLETE,
+                        phase=Phase.CLEANUP,
+                        message=(
+                            f"Nothing new: all {restored} functions resumed "
+                            f"from the last run's checkpoint. Skipping "
+                            f"cleanup, synthesis and export — pass --fresh "
+                            f"to redo them."
+                        ),
+                        data={"restored": restored},
+                    ))
+                else:
+                    self._run_cleanup()
+                    # Synthesis unifies naming across the whole binary in one
+                    # call. Spending it on draft output would only buy an
+                    # answer the finishing pass invalidates, so a draft run
+                    # leaves it.
+                    if stage is not RunStage.DRAFT:
+                        self._run_synthesis()
+                    self._run_export()
             except Exception as e:
                 logger.exception("Run failed")
                 self._emit(Event(
@@ -942,8 +1083,16 @@ class Supervisor:
             match.function_address for match in self.triage_result.signature_matches
         )
 
-    def _run_analysis(self) -> None:
-        """Analyze functions in large chunks via sequential LLM calls."""
+    def _run_analysis(self) -> tuple[int, int]:
+        """Analyze functions in large chunks via sequential LLM calls.
+
+        Returns ``(restored, fresh)``: how many functions this call reused
+        unchanged from a previous checkpoint, and how many it did new work
+        on — analyzed for the first time or improved by the automatic
+        refinement pass. ``restored and not fresh`` is a full resume: nothing
+        is different from what a previous run already wrote to disk, which is
+        what tells the caller cleanup, synthesis and export are safe to skip.
+        """
         self._emit(Event(
             type=EventType.PHASE_START,
             phase=Phase.ANALYSIS,
@@ -1154,10 +1303,11 @@ class Supervisor:
                 ))
             self._record_analysis_result(func, result)
 
+        refined = 0
         if drafting:
             self._announce_pending_finish()
         else:
-            self._run_refinement()
+            refined = self._run_refinement()
 
         self._save_state()
 
@@ -1169,6 +1319,7 @@ class Supervisor:
                 f"functions named."
             ),
         ))
+        return restored, len(all_items) - restored + refined
 
     def _limits_for(self, model: str) -> ModelLimits:
         """Chunking limits for one model of the run.

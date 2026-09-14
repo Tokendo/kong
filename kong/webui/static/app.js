@@ -40,6 +40,7 @@ const ui = {
   graph: null,          // nodes, edges and the adjacency built from them
   graphFocus: 0,
   graphAsked: false,    // the tab reads the file once, then on Reload
+  lastState: null,      // the most recent /api/state, for renders outside poll()
 };
 
 /* ----------------------------------------------------------------- plumbing */
@@ -306,13 +307,14 @@ function renderStatus(state) {
 }
 
 function renderButtons(state, hasController) {
-  const busy = state.finishing || state.checking_coherence;
+  const busy = state.finishing || state.checking_coherence || Boolean(state.analyzing_function);
   $("start").disabled = state.running;
   $("pause").disabled = !state.running;
   $("pause").textContent = state.paused ? "Resume" : "Pause";
   $("export").disabled = !hasController;
   $("finish").disabled = !hasController || busy || !state.pending_finish;
   $("coherence").disabled = !hasController || busy;
+  updateGraphAnalyzeButton(state);
 }
 
 function appendLog(entries) {
@@ -362,6 +364,9 @@ function appendResults(results) {
     const row = functionRow(result);
     if (filter && !row.dataset.haystack.includes(filter)) row.hidden = true;
     fragment.append(row);
+    patchGraphNode(result.address, {
+      n: result.name, q: result.confidence, c: result.classification, u: false,
+    });
   }
   $("functions").append(fragment);
   $("count-functions").textContent = String(ui.results.length);
@@ -404,6 +409,7 @@ async function poll() {
   }
 
   const state = payload.state;
+  ui.lastState = state;
   ui.running = state.running;
   ui.lastWait = state.llm_last_wait_seconds;
   ui.pendingFinish = state.pending_finish;
@@ -592,7 +598,52 @@ function renderGraphDetail() {
   bits.push(`${plural(callees[ui.graphFocus].length, "callee")}`);
   meta.textContent = bits.join(" \u00b7 ");
 
-  detail.append(title, meta);
+  const actions = document.createElement("p");
+  actions.className = "graph-detail-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn btn--ghost";
+  button.id = "graph-analyze";
+  button.addEventListener("click", () => requestFunctionAnalysis(node.a));
+  actions.append(button);
+
+  detail.append(title, meta, actions);
+  updateGraphAnalyzeButton(ui.lastState || {});
+}
+
+/* The button lives inside graph-detail, rebuilt on every focus change, so its
+   label and disabled state are set from here rather than from renderButtons
+   alone \u2014 that runs on a timer and would otherwise flash the wrong label for
+   up to POLL_MS after a click. */
+function updateGraphAnalyzeButton(state) {
+  const button = $("graph-analyze");
+  if (!button || !ui.graph) return;
+  const node = ui.graph.nodes[ui.graphFocus];
+  const analyzing = Boolean(state.analyzing_function);
+  button.disabled = analyzing || state.finishing || state.checking_coherence;
+  button.textContent = state.analyzing_function === node.a
+    ? "Analyzing\u2026"
+    : (node.u ? "Analyze this function" : "Re-analyze this function");
+}
+
+async function requestFunctionAnalysis(address) {
+  const button = $("graph-analyze");
+  if (button) button.disabled = true;
+  const result = await post("/api/analyze-function", { address });
+  announce(result);
+  if (!result.ok) updateGraphAnalyzeButton(ui.lastState || {});
+}
+
+function patchGraphNode(address, patch) {
+  if (!ui.graph) return;
+  const index = ui.graph.nodes.findIndex((node) => node.a === address);
+  if (index === -1) return;
+  Object.assign(ui.graph.nodes[index], patch);
+  renderGraphList();
+  if (index === ui.graphFocus) {
+    renderGraphDetail();
+    drawGraph();
+  }
 }
 
 function drawGraph() {
@@ -807,6 +858,22 @@ function wire() {
 
   $("pause").addEventListener("click", async () => announce(await post("/api/pause")));
   $("export").addEventListener("click", async () => announce(await post("/api/export")));
+
+  $("open-existing").addEventListener("click", async () => {
+    const result = await post("/api/open", { output_dir: $("output").value.trim() });
+    announce(result);
+    if (!result.ok) return;
+    // The server rebuilt these lists from zero, so the client's cursors and
+    // copies have to restart at zero too, or the next poll diffs the new
+    // list against the old one instead of showing it.
+    ui.results = [];
+    ui.resultsCursor = 0;
+    $("functions").textContent = "";
+    $("count-functions").textContent = "0";
+    ui.logCursor = 0;
+    $("log").textContent = "";
+    poll();
+  });
   $("coherence").addEventListener("click", async () =>
     announce(await post("/api/coherence")));
 

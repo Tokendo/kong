@@ -159,6 +159,14 @@ def settings_from_payload(payload: dict[str, Any]) -> RunSettings:
     )
 
 
+def _parse_address(value: Any) -> int | None:
+    """An address as the graph and the functions table both spell it: hex."""
+    try:
+        return int(str(value), 16)
+    except (TypeError, ValueError):
+        return None
+
+
 def default_output_dir(binary_path: str) -> str:
     if not binary_path:
         return str(Path.cwd() / "kong_output")
@@ -359,6 +367,88 @@ class KongSession:
         if refusal:
             return {"ok": False, "message": refusal}
         return {"ok": True, "message": f"Finishing pass on {pending} function(s)..."}
+
+    def open_existing(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Load a finished run's results for browsing, no run involved.
+
+        Reads analysis.json straight off disk: no Ghidra, no model, and
+        nothing recomputed — the opposite of Start, which is the only other
+        way today to see a directory's results, and which, even in a run that
+        resumes every function, still redoes cleanup, synthesis and export
+        over the whole binary before showing anything.
+        """
+        if self.controller is not None and self.controller.state.running:
+            return {
+                "ok": False,
+                "message": (
+                    "Pause or wait for the current run before opening another "
+                    "analysis to browse."
+                ),
+            }
+
+        output_dir = str(payload.get("output_dir", "")).strip()
+        if not output_dir:
+            return {"ok": False, "message": "Choose an output directory first."}
+
+        path = Path(output_dir).expanduser() / "analysis.json"
+        if not path.is_file():
+            return {
+                "ok": False,
+                "message": (
+                    f"{path} is not there. Nothing has been exported to this "
+                    f"directory yet."
+                ),
+            }
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            return {"ok": False, "message": f"Could not read {path}: {exc}"}
+
+        results: list[dict[str, Any]] = []
+        for entry in document.get("functions") or []:
+            address = _parse_address(entry.get("address"))
+            if address is None:
+                continue
+            results.append({
+                "i": len(results),
+                "address": f"0x{address:08x}",
+                "original": entry.get("original_name", ""),
+                "name": entry.get("name", ""),
+                "confidence": int(entry.get("confidence", 0) or 0),
+                "classification": entry.get("classification", ""),
+            })
+
+        with self._lock:
+            self._results = results
+            self._log = []
+            self._log_next = 0
+            self._append_log(
+                "phase",
+                (
+                    f"Loaded {len(results)} functions from {path}. This is a "
+                    f"read-only view — start an analysis to change anything."
+                ),
+                "notice",
+            )
+
+        return {
+            "ok": True,
+            "message": f"Loaded {len(results)} functions from {path}.",
+        }
+
+    def analyze_function(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.controller is None:
+            return {
+                "ok": False,
+                "message": "Analyze a binary first: there is no run to add to.",
+            }
+        address = _parse_address(payload.get("address"))
+        if address is None:
+            return {"ok": False, "message": "Not a function address."}
+        refusal = self.controller.request_function_analysis(address)
+        if refusal:
+            return {"ok": False, "message": refusal}
+        return {"ok": True, "message": f"Analyzing 0x{address:08x}..."}
 
     def coherence_review(self) -> dict[str, Any]:
         if self.controller is None:
@@ -735,10 +825,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(session.toggle_pause())
         elif route == "/api/export":
             self._send_json(session.export())
+        elif route == "/api/open":
+            self._send_json(session.open_existing(payload))
         elif route == "/api/finish":
             self._send_json(session.finishing_pass())
         elif route == "/api/coherence":
             self._send_json(session.coherence_review())
+        elif route == "/api/analyze-function":
+            self._send_json(session.analyze_function(payload))
         elif route == "/api/detect":
             self._send_json(detect_endpoint(str(payload.get("base_url", "")).strip()))
         elif route == "/api/key":

@@ -58,6 +58,14 @@ class _FakeSupervisor:
         self.ran = False
         self.checkpoints = 0
         self.checkpoint_error: Exception | None = None
+        self.known_addresses: set[int] = set()
+        self.analyzed_addresses: list[int] = []
+        self.analyze_run: threading.Event | None = None
+        self.analyzed = threading.Event()
+        self.queue = MagicMock()
+        self.queue.get_by_address = lambda addr: (
+            object() if addr in self.known_addresses else None
+        )
 
     def on_event(self, callback) -> None:
         self.listeners.append(callback)
@@ -87,6 +95,12 @@ class _FakeSupervisor:
     def run_finishing_pass(self) -> int:
         self.finished_pass.set()
         return 0
+
+    def analyze_function(self, address: int) -> None:
+        self.analyzed_addresses.append(address)
+        if self.analyze_run is not None:
+            self.analyze_run.wait(timeout=5)
+        self.analyzed.set()
 
     def checkpoint(self) -> None:
         if self.checkpoint_error is not None:
@@ -679,6 +693,106 @@ class TestFinishingPass:
         finally:
             release.set()
             controller._finish_thread.join(timeout=2)
+
+
+class TestFunctionAnalysis:
+    """One function, re-run on demand from a graph node or table row."""
+
+    def test_it_needs_a_run_first(self, tmp_path):
+        controller = _controller(_settings(tmp_path), _FakeSupervisor())
+        assert "Analyze a binary first" in controller.request_function_analysis(0x1000)
+
+    def test_an_unknown_address_is_refused(self, tmp_path):
+        supervisor = _FakeSupervisor()
+        controller = _controller(_settings(tmp_path), supervisor)
+        _run_to_completion(controller)
+
+        assert "not a function" in controller.request_function_analysis(0x1000)
+        assert supervisor.analyzed_addresses == []
+
+    def test_a_known_address_is_analyzed(self, tmp_path):
+        supervisor = _FakeSupervisor()
+        supervisor.known_addresses = {0x1000}
+        controller = _controller(_settings(tmp_path), supervisor)
+        _run_to_completion(controller)
+
+        assert controller.request_function_analysis(0x1000) == ""
+        assert supervisor.analyzed.wait(timeout=2)
+        assert supervisor.analyzed_addresses == [0x1000]
+
+    def test_a_running_analysis_is_asked_to_pause_first(self, tmp_path):
+        supervisor = _FakeSupervisor()
+        supervisor.known_addresses = {0x1000}
+        supervisor.finish_run = threading.Event()
+        controller = _controller(_settings(tmp_path), supervisor)
+        controller.start()
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and controller._get_supervisor() is None:
+                time.sleep(0.01)
+            assert "Pause the analysis first" in controller.request_function_analysis(0x1000)
+        finally:
+            supervisor.finish_run.set()
+
+    def test_a_released_program_is_refused(self, tmp_path):
+        ghidra_client = MagicMock()
+        ghidra_client.is_open = False
+        supervisor = _FakeSupervisor()
+        supervisor.known_addresses = {0x1000}
+        controller = _controller(
+            _settings(tmp_path), supervisor, ghidra_client=ghidra_client
+        )
+        _run_to_completion(controller)
+
+        assert "released" in controller.request_function_analysis(0x1000)
+
+    def test_it_does_not_overlap_with_the_finishing_pass(self, tmp_path):
+        supervisor = _FakeSupervisor()
+        supervisor.known_addresses = {0x1000}
+        supervisor.pending_finish = 2
+        release = threading.Event()
+        supervisor.run_finishing_pass = lambda: release.wait(timeout=2)
+        controller = _controller(_settings(tmp_path), supervisor)
+        _run_to_completion(controller)
+
+        assert controller.request_finishing_pass() == ""
+        try:
+            assert "finishing pass" in controller.request_function_analysis(0x1000)
+        finally:
+            release.set()
+            controller._finish_thread.join(timeout=2)
+
+    def test_two_requests_do_not_overlap(self, tmp_path):
+        supervisor = _FakeSupervisor()
+        supervisor.known_addresses = {0x1000, 0x2000}
+        release = threading.Event()
+        supervisor.analyze_run = release
+        controller = _controller(_settings(tmp_path), supervisor)
+        _run_to_completion(controller)
+
+        try:
+            assert controller.request_function_analysis(0x1000) == ""
+            assert "Already analyzing" in controller.request_function_analysis(0x2000)
+        finally:
+            release.set()
+            controller._function_thread.join(timeout=2)
+
+    def test_the_state_reports_which_address_while_it_lasts(self, tmp_path):
+        supervisor = _FakeSupervisor()
+        supervisor.known_addresses = {0x1000}
+        release = threading.Event()
+        supervisor.analyze_run = release
+        controller = _controller(_settings(tmp_path), supervisor)
+        _run_to_completion(controller)
+
+        controller.request_function_analysis(0x1000)
+        controller.poll()
+        assert controller.state.analyzing_function == "0x00001000"
+
+        release.set()
+        controller._function_thread.join(timeout=2)
+        controller.poll()
+        assert controller.state.analyzing_function == ""
 
 
 class TestStageSetting:

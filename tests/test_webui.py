@@ -208,6 +208,65 @@ class TestSession:
         assert "api_key" not in remembered
 
 
+class TestOpenExisting:
+    """Browsing a previous run's results without starting one.
+
+    Unlike Start, which even on a full resume still redoes cleanup, synthesis
+    and export before the window shows anything.
+    """
+
+    def test_it_needs_a_directory(self):
+        answer = KongSession().open_existing({"output_dir": ""})
+        assert not answer["ok"]
+        assert "Choose an output directory" in answer["message"]
+
+    def test_a_directory_without_analysis_json_says_so(self, tmp_path):
+        answer = KongSession().open_existing({"output_dir": str(tmp_path)})
+        assert not answer["ok"]
+        assert "analysis.json" in answer["message"]
+
+    def test_unreadable_json_is_reported_not_raised(self, tmp_path):
+        tmp_path.mkdir(exist_ok=True)
+        (tmp_path / "analysis.json").write_text("{ not json", encoding="utf-8")
+
+        answer = KongSession().open_existing({"output_dir": str(tmp_path)})
+        assert not answer["ok"]
+        assert "Could not read" in answer["message"]
+
+    def test_the_functions_become_rows_no_run_involved(self, tmp_path):
+        out = _analysis_json(tmp_path / "out", edges=[])
+        session = KongSession()
+
+        answer = session.open_existing({"output_dir": str(out)})
+
+        assert answer["ok"]
+        assert session.controller is None
+        snapshot = session.snapshot()
+        assert [r["name"] for r in snapshot["results"]] == ["game_tick", "draw_hud"]
+        assert any("Loaded 2 functions" in entry["message"] for entry in snapshot["log"])
+
+    def test_opening_again_replaces_rather_than_appends(self, tmp_path):
+        out = _analysis_json(tmp_path / "out", edges=[])
+        session = KongSession()
+        session.open_existing({"output_dir": str(out)})
+
+        session.open_existing({"output_dir": str(out)})
+
+        assert len(session.snapshot()["results"]) == 2
+
+    def test_a_running_analysis_is_not_disturbed(self, tmp_path):
+        out = _analysis_json(tmp_path / "out", edges=[])
+        session = KongSession()
+        session.controller = type(
+            "FakeController", (), {"state": type("S", (), {"running": True})()},
+        )()
+
+        answer = session.open_existing({"output_dir": str(out)})
+
+        assert not answer["ok"]
+        assert "Pause or wait" in answer["message"]
+
+
 class TestBootstrap:
     def test_every_provider_is_offered(self):
         payload = bootstrap_payload(KongSession())

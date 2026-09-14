@@ -177,6 +177,7 @@ input::placeholder { color: var(--text-faint); font-weight: var(--fw-light); }
 
 .row { display: flex; gap: 8px; align-items: center; }
 .row > input { flex: 1 1 auto; min-width: 0; }
+.row + .btn { margin-top: 8px; width: 100%; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
 .hint {
@@ -604,6 +605,7 @@ input::placeholder { color: var(--text-faint); font-weight: var(--fw-light); }
   word-break: break-word;
 }
 .graph-meta { margin: 0; font-size: .8rem; color: var(--text-muted); }
+.graph-detail-actions { margin: 10px 0 0; }
 
 /* The drawing is the one thing allowed to run wider than the pane. */
 .graph-canvas { overflow-x: auto; background: var(--bg-deep); }

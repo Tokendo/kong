@@ -86,7 +86,20 @@ class TestRefinementReason:
 
     def test_a_very_long_error_does_not_run_into_the_event_log(self):
         reason = refinement_reason(_result(error="x" * 5000))
-        assert len(reason) < 200
+        assert len(reason) < 260
+        assert reason.endswith("…")
+
+    def test_the_over_budget_reason_is_shown_in_full(self):
+        # Long, but ends in the number the reader actually needs: how far to
+        # raise --max-prompt-chars. Cutting it off defeats the message.
+        error = (
+            "Decompilation needs 57876 chars and only 42000 are left for "
+            "a function body by the 50000 char prompt budget. "
+            "Raise --max-prompt-chars to at least "
+            "65876, use a model with a larger context, or allow truncation."
+        )
+        reason = refinement_reason(_result(error=error))
+        assert reason == f"draft failed: {error}"
 
     def test_a_skipped_function_is_never_re_analyzed(self):
         skipped = _result(skipped=True, skip_reason="trivial", name="", confidence=0)

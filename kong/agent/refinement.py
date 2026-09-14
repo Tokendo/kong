@@ -35,6 +35,14 @@ DEFAULT_REFINE_BELOW = 80
 #: classification. Same boundary as FunctionClassification.LARGE.
 LARGE_FUNCTION_BYTES = 256
 
+#: Longest a draft's error is shown before it is cut off. The over-budget
+#: errors from the analyzer and the supervisor are the longest legitimate ones
+#: and run a little over 200 chars because they end in the number to raise
+#: --max-prompt-chars to — the actionable part a reader needs. The cap sits
+#: above that so those are never the ones cut; it exists only to keep a
+#: pathological error (a raw traceback, say) from running into the log.
+MAX_ERROR_CHARS = 240
+
 # Decompiler placeholders and the names a model falls back on when it has not
 # understood the function. Either way the name carries no information, which is
 # the thing worth a second pass.
@@ -82,7 +90,10 @@ def refinement_reason(
     if result.skipped:
         return ""
     if result.error:
-        return f"draft failed: {result.error[:120]}"
+        error = result.error
+        if len(error) > MAX_ERROR_CHARS:
+            error = error[:MAX_ERROR_CHARS] + "…"
+        return f"draft failed: {error}"
     if not result.name:
         return "draft returned no name"
     if is_generic_name(result.name):

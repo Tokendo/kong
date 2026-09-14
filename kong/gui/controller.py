@@ -165,6 +165,9 @@ class RunState:
     #: How many functions a finishing pass would re-read right now. What makes
     #: the button worth pressing, so it belongs in the rendered state.
     pending_finish: int = 0
+    #: The address (as "0x...") a manual, single-function analysis is
+    #: currently working on, or "" when none is running.
+    analyzing_function: str = ""
     error: str = ""
     binary_label: str = ""
     #: True while at least one request has been sent and not yet answered.
@@ -226,6 +229,8 @@ class AnalysisController:
         self._thread: threading.Thread | None = None
         self._coherence_thread: threading.Thread | None = None
         self._finish_thread: threading.Thread | None = None
+        self._function_thread: threading.Thread | None = None
+        self._analyzing_address: str = ""
         self._supervisor: Any = None
         self._llm_client: Any = None
         self._ghidra_client: Any = None
@@ -359,7 +364,9 @@ class AnalysisController:
         """True while the finishing pass or the coherence review is working."""
         return any(
             thread is not None and thread.is_alive()
-            for thread in (self._coherence_thread, self._finish_thread)
+            for thread in (
+                self._coherence_thread, self._finish_thread, self._function_thread,
+            )
         )
 
     def poll(self) -> list[Event]:
@@ -423,6 +430,11 @@ class AnalysisController:
         )
         state.finishing = (
             self._finish_thread is not None and self._finish_thread.is_alive()
+        )
+        state.analyzing_function = (
+            self._analyzing_address
+            if self._function_thread is not None and self._function_thread.is_alive()
+            else ""
         )
         if supervisor is not None:
             state.pending_finish = supervisor.pending_finish
@@ -544,4 +556,43 @@ class AnalysisController:
             target=supervisor.run_finishing_pass, daemon=True,
         )
         self._finish_thread.start()
+        return ""
+
+    def request_function_analysis(self, address: int) -> str:
+        """Re-run one function through the primary model. Returns why it did
+        not, or "".
+
+        Picked by hand — a graph node, a table row — rather than chosen by the
+        run, so it runs whatever the function's confidence or refinement
+        state. Same terms as the finishing pass: it writes into Ghidra, so
+        nothing else may be doing that at the same time. Unlike the finishing
+        pass it never re-exports; the caller decides when a rename is worth
+        writing a new decompiled.c out for.
+        """
+        supervisor = self._get_supervisor()
+        if supervisor is None:
+            return "Analyze a binary first: there is no run to add to."
+        analyzing = self._thread is not None and self._thread.is_alive()
+        if analyzing and not supervisor.is_paused:
+            return (
+                "Pause the analysis first. Analyzing a function writes its "
+                "name and signature into Ghidra, and cannot do that while the "
+                "run is still writing its own."
+            )
+        if self._finish_thread is not None and self._finish_thread.is_alive():
+            return "Wait for the finishing pass: it is still renaming functions."
+        if self._coherence_thread is not None and self._coherence_thread.is_alive():
+            return "Wait for the coherence pass: it is still renaming functions."
+        if self._function_thread is not None and self._function_thread.is_alive():
+            return "Already analyzing a function; wait for it to finish."
+        if not self._ghidra_is_open():
+            return _GHIDRA_RELEASED
+        if supervisor.queue.get_by_address(address) is None:
+            return f"0x{address:08x} is not a function this run knows about."
+
+        self._analyzing_address = f"0x{address:08x}"
+        self._function_thread = threading.Thread(
+            target=supervisor.analyze_function, args=(address,), daemon=True,
+        )
+        self._function_thread.start()
         return ""
