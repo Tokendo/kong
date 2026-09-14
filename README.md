@@ -352,11 +352,51 @@ between functions that were named, and loses every call into one that was
 skipped. It is also what `--transpile-only` walks to decide what a selected
 function drags in.
 
+### What a run spends its time on
+
+Three things decide how long a run takes, and all three are adjustable.
+
+**Obfuscation detection is decided over the binary, not per function.** The
+per-function heuristics read structure, and structure does not separate
+obfuscated code from ordinary code shaped like it: a `while(1)` around a
+`switch` with a few dozen cases is control-flow flattening, and it is also
+every format engine, interpreter and protocol state machine ever written by
+hand. A flagged function goes to the agentic deobfuscation loop, which is the
+most expensive path in the tool. So the detections are only acted on when
+enough of the binary trips them — a protector is applied wholesale, and a
+handful of hits in a thousand functions is the heuristics misfiring:
+
+```bash
+kong analyze ./binary --obfuscation-threshold 0.2   # stricter
+kong analyze ./binary --obfuscation-threshold 0     # act on every detection
+```
+
+Functions the signature database already identifies never take that path at
+all, and `--skip-known-library` drops them from the analysis entirely rather
+than paying a model to describe a documented library function. The loop is
+also bounded in wall clock, not only in rounds — `--deobfuscation-budget`,
+900 seconds by default — because ten agentic rounds against a slow endpoint,
+each with its own request deadline and retries, is hours on one function.
+
+**Chunk calls can overlap.** The work queue is ordered bottom-up by call-graph
+depth, so functions in flight at the same time are never each other's callees.
+`--concurrency` sets how many chunk calls are sent at once: 4 by default on a
+hosted API, 1 on a local endpoint, which is already using the machine Kong runs
+on. Results are written back on one thread, in chunk order, so a run's events
+and its state file do not depend on which call answered first.
+
+**A failed chunk is retried, then halved.** A chunk is one request covering
+many functions, so one transient error used to fail all of them at once —
+which is why failures arrived in bursts. The call is now retried, and then the
+chunk is split in half and each half sent again, down to single functions, so
+what fails is the function the endpoint actually objects to and not the fifteen
+sharing its request.
+
 ### When functions fail
 
 A run rarely names every function. `analysis.json` lists what failed under
 `failures` with a reason per address, and a phase that fell over without
-stopping the run — synthesis timing out, a translation failing — under
+stopping the run — a synthesis group timing out, a translation failing — under
 `phase_failures`, so a partial result says so in the artefact rather than only
 in the log. `events.log` holds the full trace — rewritten on each run, so keep a
 copy before re-running into the same directory. `kong -v analyze ...` adds DEBUG
@@ -531,6 +571,19 @@ edit or a Ghidra upgrade (`--resume` is still accepted and does nothing):
 ```bash
 kong analyze ./binary --fresh
 ```
+
+### Library functions
+
+Kong ships name-based signatures for the C standard library, common crypto
+primitives, and the Microsoft C runtime — the last matters on any statically
+linked MSVC binary, where a sixth of the functions are runtime that Ghidra has
+often already named (`_output`, `__ld12tod`, `_shortsort`). A matched function
+is never sent to the deobfuscation loop, and with `--skip-known-library` it is
+not analyzed at all.
+
+The match is on the name Ghidra resolved, never on "this function has a name":
+on a resumed run that name is Kong's own from the run before, so every function
+analyzed once would otherwise look like documented library code.
 
 ### Reconstruction in another language
 

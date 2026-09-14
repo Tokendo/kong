@@ -1029,7 +1029,7 @@ class TestResume:
     ):
         import kong.agent.supervisor as supervisor_module
 
-        def explode(results, output_dir, binary=None):
+        def explode(results, output_dir, binary=None, call_edges=None):
             raise OSError("read-only file system")
 
         monkeypatch.setattr(supervisor_module, "save_state", explode)
@@ -2121,3 +2121,158 @@ class TestTranspileSelection:
 
         document = json.loads((tmp_path / "out" / "analysis.json").read_text())
         assert ["0x00001000", "0x00002000"] in document["call_graph"]["edges"]
+
+
+class TestObfuscationRouting:
+    """What the binary-level verdict actually changes about where work goes."""
+
+    CRT_ENGINE = (
+        "void _output(void)\n{\n  while (true) {\n    switch(state) {\n"
+        + "".join(
+            f"    case 0x{case:x}:\n      state = {case + 1};\n      break;\n"
+            for case in range(1, 25)
+        )
+        + "    }\n  }\n}\n"
+        + "  /* padding */\n" * 220
+    )
+
+    def _run(self, tmp_path, count, decompilation, **analysis):
+        from kong.config import AnalysisConfig
+
+        funcs = [_func(0x1000 + i * 0x100, f"FUN_{0x1000 + i * 0x100:08x}")
+                 for i in range(count)]
+        client = _make_client(functions=funcs)
+        client.get_decompilation.return_value = decompilation
+        config = KongConfig(
+            output=OutputConfig(directory=tmp_path / "out"),
+            analysis=AnalysisConfig(**analysis),
+        )
+        mock_llm = MagicMock()
+        mock_llm.analyze_function_batch.side_effect = _batch_response_with_addresses
+        mock_llm.analyze_with_tools.return_value = LLMResponse(
+            name="deobfuscated", confidence=70, raw="{}",
+        )
+        mock_llm.analyze_function.return_value = LLMResponse(
+            name="", raw='{"globals":{},"structs":[],"name_refinements":{}}',
+        )
+        sup = Supervisor(client, config, llm_client=mock_llm)
+        sup.run()
+        return sup, mock_llm
+
+    def test_a_clean_binary_does_not_enter_the_agentic_loop(self, tmp_path):
+        """Every function looks like a state machine, but none of it is protected.
+
+        Here the heuristics fire on 100% of functions, so the verdict believes
+        them; the case that matters is the opposite one below.
+        """
+        sup, llm = self._run(tmp_path, 6, self.CRT_ENGINE)
+
+        assert sup._obfuscation_believed
+
+    def test_a_few_hits_in_a_large_binary_are_dismissed(self, tmp_path):
+        from kong.config import AnalysisConfig
+
+        total = 60
+        funcs = [_func(0x1000 + i * 0x100, f"FUN_{0x1000 + i * 0x100:08x}")
+                 for i in range(total)]
+        client = _make_client(functions=funcs)
+        flagged = {funcs[0].address, funcs[1].address}
+
+        def decompilation(address, *args, **kwargs):
+            return self.CRT_ENGINE if address in flagged else "void f(void) { return; }"
+
+        client.get_decompilation.side_effect = decompilation
+        config = KongConfig(
+            output=OutputConfig(directory=tmp_path / "out"),
+            analysis=AnalysisConfig(),
+        )
+        mock_llm = MagicMock()
+        mock_llm.analyze_function_batch.side_effect = _batch_response_with_addresses
+        mock_llm.analyze_function.return_value = LLMResponse(
+            name="", raw='{"globals":{},"structs":[],"name_refinements":{}}',
+        )
+        sup = Supervisor(client, config, llm_client=mock_llm)
+
+        sup.run()
+
+        # 2 of 60 is under the 5% threshold: no agentic loop, everything batched.
+        assert not sup._obfuscation_believed
+        mock_llm.analyze_with_tools.assert_not_called()
+
+    def test_a_threshold_of_zero_brings_the_old_behaviour_back(self, tmp_path):
+        from kong.config import AnalysisConfig
+
+        total = 60
+        funcs = [_func(0x1000 + i * 0x100, f"FUN_{0x1000 + i * 0x100:08x}")
+                 for i in range(total)]
+        client = _make_client(functions=funcs)
+        flagged = {funcs[0].address}
+
+        def decompilation(address, *args, **kwargs):
+            return self.CRT_ENGINE if address in flagged else "void f(void) { return; }"
+
+        client.get_decompilation.side_effect = decompilation
+        config = KongConfig(
+            output=OutputConfig(directory=tmp_path / "out"),
+            analysis=AnalysisConfig(obfuscation_threshold=0.0),
+        )
+        mock_llm = MagicMock()
+        mock_llm.analyze_function_batch.side_effect = _batch_response_with_addresses
+        mock_llm.analyze_with_tools.return_value = LLMResponse(
+            name="deobfuscated", confidence=70, raw="{}",
+        )
+        mock_llm.analyze_function.return_value = LLMResponse(
+            name="", raw='{"globals":{},"structs":[],"name_refinements":{}}',
+        )
+        sup = Supervisor(client, config, llm_client=mock_llm)
+
+        sup.run()
+
+        assert sup._obfuscation_believed
+        mock_llm.analyze_with_tools.assert_called()
+
+
+class TestSkippingKnownLibraryCode:
+    def test_a_matched_function_is_not_sent_to_the_model(self, tmp_path):
+        from kong.agent.signatures import SignatureMatch
+        from kong.config import AnalysisConfig
+
+        funcs = [_func(0x1000, "memcpy"), _func(0x2000, "FUN_00002000")]
+        client = _make_client(functions=funcs)
+        client.get_decompilation.return_value = "void f(void) { return; }"
+        config = KongConfig(
+            output=OutputConfig(directory=tmp_path / "out"),
+            analysis=AnalysisConfig(skip_matched_signatures=True),
+        )
+        mock_llm = MagicMock()
+        mock_llm.analyze_function_batch.side_effect = _batch_response_with_addresses
+        mock_llm.analyze_function.return_value = LLMResponse(
+            name="", raw='{"globals":{},"structs":[],"name_refinements":{}}',
+        )
+        sup = Supervisor(client, config, llm_client=mock_llm)
+
+        sup.run()
+
+        assert sup.results[0x1000].skipped
+        assert sup.results[0x1000].skip_reason == "identified by signature"
+        sent = "".join(
+            call.args[0] for call in mock_llm.analyze_function_batch.call_args_list
+        )
+        assert "0x00001000" not in sent
+        assert "0x00002000" in sent
+
+    def test_it_is_off_by_default(self, tmp_path):
+        funcs = [_func(0x1000, "memcpy")]
+        client = _make_client(functions=funcs)
+        client.get_decompilation.return_value = "void f(void) { return; }"
+        config = KongConfig(output=OutputConfig(directory=tmp_path / "out"))
+        mock_llm = MagicMock()
+        mock_llm.analyze_function_batch.side_effect = _batch_response_with_addresses
+        mock_llm.analyze_function.return_value = LLMResponse(
+            name="", raw='{"globals":{},"structs":[],"name_refinements":{}}',
+        )
+        sup = Supervisor(client, config, llm_client=mock_llm)
+
+        sup.run()
+
+        assert not sup.results[0x1000].skipped

@@ -1,11 +1,28 @@
 """Deobfuscator agent — classifies obfuscation techniques and orchestrates
 LLM-driven deobfuscation with symbolic tool access.
+
+The per-function heuristics below read structure, and structure alone does not
+separate obfuscated code from ordinary code that happens to look like it: a
+`while(1)` around a `switch` with a few dozen cases is control-flow flattening,
+and it is also every format engine, interpreter and protocol state machine ever
+written by hand. On a clean 1998 game binary these matched `printf`, `scanf`,
+`memmove` and the CRT float-to-string converter, and the agentic loop they
+routed to spent three hours of a six-hour run on them.
+
+So the decision is taken twice. `classify_obfuscation` still reports what a
+function's shape suggests, and `obfuscation_verdict` then asks whether the
+binary as a whole supports the claim: a protector is applied wholesale, so a
+handful of hits across a thousand functions is the heuristics misfiring, not a
+binary under protection. See `BinaryVerdict`.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import time
+from collections.abc import Collection
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -131,6 +148,91 @@ def _detect_vmprotect(code: str) -> bool:
     return len(lines) > 200
 
 
+#: Wall clock one function's deobfuscation loop may spend before it answers
+#: with whatever it has. Ten agentic rounds against a slow endpoint, each with
+#: its own request deadline and retries, is otherwise hours on one function:
+#: on the FA18 run a single CRT converter spent 1h48 in here and produced
+#: nothing at all.
+DEOBFUSCATION_TIME_BUDGET = 900.0
+
+#: Share of a binary's functions that must trip the heuristics before their
+#: verdict is believed. A protector rewrites everything it covers, so real
+#: control-flow flattening shows up in tens of per cent; anything at the level
+#: of a few functions in a thousand is the shape of ordinary state machines.
+BINARY_OBFUSCATION_THRESHOLD = 0.05
+
+#: Below the threshold the heuristics are still worth hearing when they agree
+#: on a lot of functions in absolute terms — a small binary that is entirely
+#: protected would otherwise be dismissed for being small.
+MIN_OBFUSCATED_FUNCTIONS = 12
+
+
+@dataclass(frozen=True)
+class BinaryVerdict:
+    """Whether a binary's obfuscation detections are worth acting on.
+
+    `flagged` of `total` functions tripped the per-function heuristics.
+    `believed` is the answer to the only question that matters afterwards:
+    does the deobfuscation loop run, or was this a false positive?
+    """
+
+    flagged: int
+    total: int
+    believed: bool
+    threshold: float
+
+    @property
+    def share(self) -> float:
+        return self.flagged / self.total if self.total else 0.0
+
+    def describe(self) -> str:
+        if self.believed:
+            return (
+                f"{self.flagged}/{self.total} functions ({self.share:.1%}) show "
+                f"obfuscation; deobfuscating them."
+            )
+        return (
+            f"{self.flagged}/{self.total} functions ({self.share:.1%}) tripped the "
+            f"obfuscation heuristics, under the {self.threshold:.0%} a protected "
+            f"binary shows. Treating them as false positives — a while(1)/switch "
+            f"is also what every hand-written state machine looks like."
+        )
+
+
+def obfuscation_verdict(
+    flagged: int,
+    total: int,
+    threshold: float = BINARY_OBFUSCATION_THRESHOLD,
+    minimum: int = MIN_OBFUSCATED_FUNCTIONS,
+) -> BinaryVerdict:
+    """Decide whether a binary's detections describe a protector or noise.
+
+    A threshold of 0 believes every detection, which is the way back to the
+    old behaviour for someone analysing a binary they know is protected in one
+    place only.
+    """
+    believed = (
+        total > 0
+        and flagged > 0
+        and (threshold <= 0 or flagged >= minimum or flagged / total >= threshold)
+    )
+    return BinaryVerdict(
+        flagged=flagged, total=total, believed=believed, threshold=threshold,
+    )
+
+
+def is_known_library_code(address: int, signature_matches: Collection[int]) -> bool:
+    """True when the signature database has already identified this function.
+
+    Library code is where the heuristics misfire hardest — the CRT is full of
+    large dispatch loops — and it is also where the agentic loop has least to
+    offer, because the function is already named and documented. Ghidra's own
+    name is deliberately not the signal: on a resumed run it is Kong's name
+    from the run before, so every function analysed once would look identified.
+    """
+    return address in signature_matches
+
+
 def load_patterns(techniques: list[ObfuscationType]) -> str:
     """Load and concatenate pattern library files for the given techniques."""
     parts: list[str] = []
@@ -169,6 +271,7 @@ class Deobfuscator:
         self,
         context: AnalysisContext,
         techniques: list[ObfuscationType],
+        max_seconds: float | None = DEOBFUSCATION_TIME_BUDGET,
     ) -> tuple[LLMResponse, int]:
         """Run LLM-driven deobfuscation with tool access.
 
@@ -178,11 +281,17 @@ class Deobfuscator:
         prompt = self._build_prompt(context, techniques, pattern_context)
         executor = ToolExecutor(self.client)
 
+        started = time.monotonic()
         response = self.llm.analyze_with_tools(
             prompt=prompt,
             system=DEOBFUSCATION_SYSTEM_PROMPT,
             tools=DEOBFUSCATION_TOOLS,
             tool_executor=executor,
+            max_seconds=max_seconds,
+        )
+        logger.debug(
+            "Deobfuscated 0x%08x in %.0fs and %d tool calls.",
+            context.function.address, time.monotonic() - started, executor.call_count,
         )
         return response, executor.call_count
 

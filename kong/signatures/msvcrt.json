@@ -1,0 +1,1051 @@
+[
+  {
+    "name": "mainCRTStartup",
+    "aliases": [
+      "wmainCRTStartup"
+    ],
+    "description": "MSVC C runtime entry point for a console program",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "WinMainCRTStartup",
+    "aliases": [
+      "wWinMainCRTStartup"
+    ],
+    "description": "MSVC C runtime entry point for a windowed program",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_cinit",
+    "aliases": [],
+    "description": "Runs the C runtime initializers before main",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_heap_init",
+    "aliases": [],
+    "description": "Initializes the MSVC heap at startup",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_ioinit",
+    "aliases": [],
+    "description": "Initializes the low-level file handle table at startup",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_setargv",
+    "aliases": [
+      "__setargv",
+      "_wsetargv"
+    ],
+    "description": "Builds argv from the command line at startup",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_setenvp",
+    "aliases": [
+      "_wsetenvp"
+    ],
+    "description": "Builds envp from the process environment at startup",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_amsg_exit",
+    "aliases": [],
+    "description": "Prints a runtime error message and exits",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_FF_MSGBANNER",
+    "aliases": [],
+    "description": "Writes the MSVC runtime error banner",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_NMSG_WRITE",
+    "aliases": [],
+    "description": "Writes a numbered MSVC runtime error message",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "__crtMessageBoxA",
+    "aliases": [],
+    "description": "Loads user32 and shows a runtime error message box",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_except_handler3",
+    "aliases": [],
+    "description": "MSVC structured exception handler for a function with a scope table",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_local_unwind2",
+    "aliases": [],
+    "description": "Unwinds local scopes during exception handling",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_global_unwind2",
+    "aliases": [],
+    "description": "Unwinds the frame chain during exception handling",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_chkstk",
+    "aliases": [
+      "__chkstk",
+      "_alloca_probe",
+      "__alloca_probe"
+    ],
+    "description": "Probes the stack a page at a time for a large frame",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_ftol",
+    "aliases": [
+      "__ftol",
+      "_ftol2",
+      "__ftol2",
+      "_ftol2_sse"
+    ],
+    "description": "Converts a double on the x87 stack to a 32-bit integer",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_allmul",
+    "aliases": [
+      "__allmul"
+    ],
+    "description": "64-bit signed multiply helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_alldiv",
+    "aliases": [
+      "__alldiv"
+    ],
+    "description": "64-bit signed divide helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_allrem",
+    "aliases": [
+      "__allrem"
+    ],
+    "description": "64-bit signed remainder helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_aulldiv",
+    "aliases": [
+      "__aulldiv"
+    ],
+    "description": "64-bit unsigned divide helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_aullrem",
+    "aliases": [
+      "__aullrem"
+    ],
+    "description": "64-bit unsigned remainder helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_allshl",
+    "aliases": [
+      "__allshl"
+    ],
+    "description": "64-bit left shift helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_allshr",
+    "aliases": [
+      "__allshr"
+    ],
+    "description": "64-bit arithmetic right shift helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_aullshr",
+    "aliases": [
+      "__aullshr"
+    ],
+    "description": "64-bit logical right shift helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_output",
+    "aliases": [
+      "__output",
+      "_woutput"
+    ],
+    "description": "The printf family's format engine",
+    "indicators": {
+      "constants": [],
+      "patterns": [
+        "large while/switch state machine over a format string; not obfuscation, this is what the CRT looks like"
+      ],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_input",
+    "aliases": [
+      "__input",
+      "_winput"
+    ],
+    "description": "The scanf family's format engine",
+    "indicators": {
+      "constants": [],
+      "patterns": [
+        "large while/switch state machine over a format string"
+      ],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_filbuf",
+    "aliases": [
+      "__filbuf"
+    ],
+    "description": "Refills a FILE's input buffer",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_flsbuf",
+    "aliases": [
+      "__flsbuf"
+    ],
+    "description": "Flushes a FILE's output buffer and writes one character",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_flush",
+    "aliases": [
+      "__flush"
+    ],
+    "description": "Writes a FILE's buffer through to its handle",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_openfile",
+    "aliases": [
+      "__openfile"
+    ],
+    "description": "Opens a FILE stream for fopen",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_getstream",
+    "aliases": [
+      "__getstream"
+    ],
+    "description": "Takes a free FILE slot from the stream table",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_freebuf",
+    "aliases": [
+      "__freebuf"
+    ],
+    "description": "Releases a FILE's buffer",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_fread_lk",
+    "aliases": [
+      "__fread_lk"
+    ],
+    "description": "fread without taking the stream lock",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_fwrite_lk",
+    "aliases": [
+      "__fwrite_lk"
+    ],
+    "description": "fwrite without taking the stream lock",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_fclose_lk",
+    "aliases": [
+      "__fclose_lk"
+    ],
+    "description": "fclose without taking the stream lock",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "ungetc",
+    "aliases": [
+      "_ungetc",
+      "_ungetc_lk"
+    ],
+    "description": "Pushes one character back onto a stream",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "int ungetc(int c, FILE *stream)"
+  },
+  {
+    "name": "_rmtmp",
+    "aliases": [],
+    "description": "Closes and deletes the temporary files this process created",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_genfname",
+    "aliases": [
+      "__genfname"
+    ],
+    "description": "Builds a unique temporary file name",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "tmpfile",
+    "aliases": [],
+    "description": "Creates a temporary file open for update",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "FILE *tmpfile(void)"
+  },
+  {
+    "name": "_sopen",
+    "aliases": [
+      "__sopen",
+      "_wsopen"
+    ],
+    "description": "Opens a file with a sharing mode",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_lseek",
+    "aliases": [
+      "_lseeki64"
+    ],
+    "description": "Moves a file handle's position",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "long _lseek(int fd, long offset, int origin)"
+  },
+  {
+    "name": "_chsize",
+    "aliases": [
+      "__chsize"
+    ],
+    "description": "Truncates or extends a file by handle",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_setmode",
+    "aliases": [],
+    "description": "Switches a file handle between text and binary",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "int _setmode(int fd, int mode)"
+  },
+  {
+    "name": "_isatty",
+    "aliases": [],
+    "description": "True when a file handle is a character device",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "int _isatty(int fd)"
+  },
+  {
+    "name": "_get_osfhandle",
+    "aliases": [],
+    "description": "Maps a CRT file descriptor to its Win32 HANDLE",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "intptr_t _get_osfhandle(int fd)"
+  },
+  {
+    "name": "_alloc_osfhnd",
+    "aliases": [
+      "__alloc_osfhnd"
+    ],
+    "description": "Takes a free slot in the file handle table",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_free_osfhnd",
+    "aliases": [
+      "__free_osfhnd"
+    ],
+    "description": "Releases a slot in the file handle table",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_set_osfhnd",
+    "aliases": [
+      "__set_osfhnd"
+    ],
+    "description": "Binds a Win32 HANDLE to a CRT file descriptor",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_control87",
+    "aliases": [
+      "__control87"
+    ],
+    "description": "Reads or changes the x87 control word",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "unsigned int _control87(unsigned int newv, unsigned int mask)"
+  },
+  {
+    "name": "_controlfp",
+    "aliases": [
+      "__controlfp"
+    ],
+    "description": "Reads or changes the floating-point control word",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "unsigned int _controlfp(unsigned int newv, unsigned int mask)"
+  },
+  {
+    "name": "_statusfp",
+    "aliases": [],
+    "description": "Reads the floating-point status word",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "unsigned int _statusfp(void)"
+  },
+  {
+    "name": "_87except",
+    "aliases": [
+      "__87except"
+    ],
+    "description": "Translates an x87 exception into a C runtime signal",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_fptostr",
+    "aliases": [
+      "__fptostr"
+    ],
+    "description": "Formats a converted floating-point value into digits",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_fltout",
+    "aliases": [
+      "__fltout",
+      "_fltout2"
+    ],
+    "description": "Converts a double to the CRT's intermediate digit form",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_atodbl",
+    "aliases": [
+      "__atodbl"
+    ],
+    "description": "Converts an ASCII string to a double",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_atoflt",
+    "aliases": [
+      "__atoflt"
+    ],
+    "description": "Converts an ASCII string to a float",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_ld12tod",
+    "aliases": [
+      "__ld12tod"
+    ],
+    "description": "Converts the CRT's 12-byte long double to a double",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_ld12tof",
+    "aliases": [
+      "__ld12tof"
+    ],
+    "description": "Converts the CRT's 12-byte long double to a float",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_ld12cvt",
+    "aliases": [
+      "__ld12cvt"
+    ],
+    "description": "Converts between the CRT's 12-byte long double forms",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_decomp",
+    "aliases": [
+      "__decomp"
+    ],
+    "description": "Decomposes a double into mantissa and exponent for printing",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_set_exp",
+    "aliases": [
+      "__set_exp"
+    ],
+    "description": "Sets the exponent field of a floating-point value",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_Ldmul",
+    "aliases": [
+      "__Ldmul"
+    ],
+    "description": "Extended-precision multiply helper",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_Ldtento",
+    "aliases": [
+      "__Ldtento"
+    ],
+    "description": "Scales an extended-precision value by a power of ten",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_ecvt",
+    "aliases": [],
+    "description": "Converts a double to a digit string with a fixed precision",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "char *_ecvt(double value, int count, int *dec, int *sign)"
+  },
+  {
+    "name": "_fcvt",
+    "aliases": [],
+    "description": "Converts a double to a digit string after the decimal point",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "char *_fcvt(double value, int count, int *dec, int *sign)"
+  },
+  {
+    "name": "_gcvt",
+    "aliases": [],
+    "description": "Converts a double to a string in %e or %f form",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "char *_gcvt(double value, int digits, char *buffer)"
+  },
+  {
+    "name": "_shortsort",
+    "aliases": [
+      "__shortsort"
+    ],
+    "description": "qsort's insertion sort for a short partition",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_swap",
+    "aliases": [
+      "__swap"
+    ],
+    "description": "qsort's element swap",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "tolower",
+    "aliases": [
+      "_tolower",
+      "__tolower"
+    ],
+    "description": "Converts one character to lower case",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "int tolower(int c)"
+  },
+  {
+    "name": "toupper",
+    "aliases": [
+      "_toupper",
+      "__toupper"
+    ],
+    "description": "Converts one character to upper case",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "int toupper(int c)"
+  },
+  {
+    "name": "_ismbbtype",
+    "aliases": [
+      "_x_ismbbtype",
+      "__ismbbtype"
+    ],
+    "description": "Tests a byte against a multibyte character class",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_setmbcp",
+    "aliases": [],
+    "description": "Selects the multibyte code page",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "int _setmbcp(int codepage)"
+  },
+  {
+    "name": "_getSystemCP",
+    "aliases": [
+      "__getSystemCP"
+    ],
+    "description": "Resolves the system's ANSI or OEM code page",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_setSBCS",
+    "aliases": [
+      "__setSBCS"
+    ],
+    "description": "Switches the runtime to single-byte character handling",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_mbsnbicoll",
+    "aliases": [],
+    "description": "Case-insensitive multibyte string collation by byte count",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_wtomb_environ",
+    "aliases": [
+      "___wtomb_environ"
+    ],
+    "description": "Converts the wide environment block to multibyte",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_setlocale",
+    "aliases": [
+      "setlocale"
+    ],
+    "description": "Sets one of the C locale categories",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "char *setlocale(int category, const char *locale)"
+  },
+  {
+    "name": "_onexit",
+    "aliases": [
+      "__onexit",
+      "_onexit_nolock"
+    ],
+    "description": "Registers a function to run at exit",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_initterm",
+    "aliases": [
+      "__initterm",
+      "_initterm_e"
+    ],
+    "description": "Runs a table of initializer function pointers",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_purecall",
+    "aliases": [],
+    "description": "Reports a call through a pure virtual function",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": ""
+  },
+  {
+    "name": "_msize",
+    "aliases": [],
+    "description": "Reports the usable size of a heap block",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "size_t _msize(void *block)"
+  },
+  {
+    "name": "_expand",
+    "aliases": [],
+    "description": "Resizes a heap block in place",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "void *_expand(void *block, size_t size)"
+  },
+  {
+    "name": "_heapchk",
+    "aliases": [],
+    "description": "Checks the heap for consistency",
+    "indicators": {
+      "constants": [],
+      "patterns": [],
+      "strings": []
+    },
+    "signature": "int _heapchk(void)"
+  }
+]

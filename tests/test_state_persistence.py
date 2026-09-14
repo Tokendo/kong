@@ -12,6 +12,7 @@ from kong.state.persistence import (
     STATE_NAME,
     STATE_VERSION,
     BinaryIdentity,
+    load_call_edges,
     load_state,
     save_state,
     state_path,
@@ -244,3 +245,49 @@ class TestAtomicWrite:
 
         monkeypatch.undo()
         assert load_state(tmp_path)[0x1000].name == "first"
+
+
+class TestCallEdges:
+    """The call graph is the one thing a run cannot work out again afterwards.
+
+    Parsing the exported C back only finds calls between functions that were
+    named, and loses every call into one that was skipped — 297 of them on the
+    FA18 binary.
+    """
+
+    def test_edges_survive_a_round_trip(self, tmp_path):
+        save_state({}, tmp_path, call_edges=[(0x1000, 0x2000), (0x2000, 0x3000)])
+
+        assert load_call_edges(tmp_path) == [(0x1000, 0x2000), (0x2000, 0x3000)]
+
+    def test_a_state_file_without_them_reads_as_none(self, tmp_path):
+        save_state({}, tmp_path)
+
+        assert load_call_edges(tmp_path) == []
+
+    def test_no_state_file_at_all_reads_as_none(self, tmp_path):
+        assert load_call_edges(tmp_path) == []
+
+    def test_saving_edges_does_not_disturb_the_results(self, tmp_path):
+        results = {
+            0x1000: FunctionResult(
+                address=0x1000, original_name="FUN_00001000", name="main",
+                confidence=90,
+            ),
+        }
+        save_state(results, tmp_path, call_edges=[(0x1000, 0x2000)])
+
+        assert load_state(tmp_path)[0x1000].name == "main"
+        assert load_call_edges(tmp_path) == [(0x1000, 0x2000)]
+
+    def test_a_malformed_edge_is_dropped_rather_than_crashing_the_load(self, tmp_path):
+        import json
+
+        save_state({}, tmp_path, call_edges=[(0x1000, 0x2000)])
+        path = state_path(tmp_path)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["call_edges"].append(["0x3000", None])
+        document["call_edges"].append([1])
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert load_call_edges(tmp_path) == [(0x1000, 0x2000)]

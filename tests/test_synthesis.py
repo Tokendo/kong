@@ -183,15 +183,26 @@ Trailing text'''
 
 class TestSynthesisCap:
     def test_synthesis_caps_at_50_functions(self) -> None:
+        """The cap is on the whole pass, not on one call.
 
+        Grouping splits the pass across several calls, so the claim to hold is
+        that the groups together carry no more than the cap.
+        """
         results = [_make_result(i, f"func_{i}") for i in range(100)]
         decomps = {i: f"void func_{i}(void) {{ DAT_1000 = 1; }}" for i in range(100)}
 
         synth = SemanticSynthesizer(FakeLLMClient())
-        prompt = synth._build_synthesis_prompt(results, decomps)
+        groups = synth._group(results, decomps)
 
-        func_count = prompt.count("### func_")
-        assert func_count <= SYNTHESIS_FUNCTION_CAP
+        assert sum(len(group) for group in groups) <= SYNTHESIS_FUNCTION_CAP
+
+    def test_one_call_when_nothing_bounds_the_prompt(self) -> None:
+        results = [_make_result(i, f"func_{i}") for i in range(10)]
+        decomps = {i: f"void func_{i}(void) {{ DAT_1000 = 1; }}" for i in range(10)}
+
+        synth = SemanticSynthesizer(FakeLLMClient())
+
+        assert len(synth._group(results, decomps)) == 1
 
     def test_prioritizes_functions_with_most_xrefs(self) -> None:
         results = [_make_result(i, f"func_{i}") for i in range(60)]

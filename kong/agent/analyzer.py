@@ -20,7 +20,11 @@ from kong.ghidra.client import GhidraClient
 from kong.ghidra.types import BinaryInfo, FunctionInfo, StringEntry, StructDefinition
 from kong.llm.limits import take_within_budget
 from kong.normalizer.syntactic import normalize
-from kong.agent.deobfuscator import classify_obfuscation
+from kong.agent.deobfuscator import (
+    DEOBFUSCATION_TIME_BUDGET,
+    ObfuscationType,
+    classify_obfuscation,
+)
 
 if TYPE_CHECKING:
     from kong.agent.deobfuscator import Deobfuscator
@@ -113,6 +117,7 @@ class LLMClient(Protocol):
         tools: list[ToolSchema],
         tool_executor: ToolExecutor,
         max_rounds: int = 10,
+        max_seconds: float | None = None,
     ) -> LLMResponse: ...
 
     def analyze_function_batch(
@@ -222,11 +227,13 @@ class Analyzer:
         llm_client: LLMClient,
         deobfuscator: Deobfuscator | None = None,
         max_prompt_chars: int | None = None,
+        deobfuscation_time_budget: float | None = DEOBFUSCATION_TIME_BUDGET,
     ) -> None:
         self.client = client
         self.llm = llm_client
         self._deobfuscator = deobfuscator
         self.max_prompt_chars = max_prompt_chars
+        self.deobfuscation_time_budget = deobfuscation_time_budget
 
     def _section_budget(self) -> int | None:
         """Char budget for one context section that grows with the binary."""
@@ -242,8 +249,15 @@ class Analyzer:
         strings: list[StringEntry],
         known_types: list[StructDefinition] | None = None,
         model: str | None = None,
+        techniques: list[ObfuscationType] | None = None,
     ) -> FunctionResult:
-        """Full analysis pipeline for one function."""
+        """Full analysis pipeline for one function.
+
+        *techniques* is what the caller already decided about this function's
+        obfuscation. Passing it matters: the decision is taken over the whole
+        binary, not one function at a time, and re-running the per-function
+        heuristics here would undo that — see kong.agent.deobfuscator.
+        """
 
         func = item.function
         context = self._build_context(item, binary_info, known_results, strings, known_types)
@@ -267,10 +281,15 @@ class Analyzer:
                 ),
             )
 
-        techniques = classify_obfuscation(context.decompilation) if self._deobfuscator else []
+        if techniques is None:
+            techniques = (
+                classify_obfuscation(context.decompilation) if self._deobfuscator else []
+            )
 
         if techniques and self._deobfuscator:
-            response, tool_calls = self._deobfuscator.deobfuscate(context, techniques)
+            response, tool_calls = self._deobfuscator.deobfuscate(
+                context, techniques, max_seconds=self.deobfuscation_time_budget,
+            )
         else:
             prompt = self._build_prompt(context)
             response = self.llm.analyze_function(prompt, model=model)

@@ -28,6 +28,7 @@ from kong.banner import (
 )
 from kong.config import (
     ZAI_BASE_URL,
+    AnalysisConfig,
     GhidraConfig,
     KongConfig,
     LLMConfig,
@@ -445,6 +446,50 @@ def _print_final_stats(supervisor: Supervisor, llm_client: LLMClient) -> None:
     ),
 )
 @click.option(
+    "--concurrency",
+    type=click.IntRange(1, 32),
+    default=None,
+    help=(
+        "Chunk calls in flight at once. The work queue is ordered bottom-up "
+        "and functions at the same depth do not depend on each other, so the "
+        "calls need not wait for one another. Defaults to 4 on a hosted API "
+        "and 1 on a local endpoint, which is already busy."
+    ),
+)
+@click.option(
+    "--obfuscation-threshold",
+    type=click.FloatRange(0.0, 1.0),
+    default=None,
+    metavar="SHARE",
+    help=(
+        "Share of functions that must look obfuscated before the agentic "
+        "deobfuscation loop is used at all (default 0.05). The heuristics read "
+        "structure, and a while(1) around a switch is both control-flow "
+        "flattening and every hand-written state machine, so on a clean binary "
+        "they fire on the C runtime. A protector is applied wholesale. Use 0 "
+        "to act on every detection."
+    ),
+)
+@click.option(
+    "--deobfuscation-budget",
+    type=click.IntRange(0, 86400),
+    default=None,
+    metavar="SECONDS",
+    help=(
+        "Wall clock one function's deobfuscation loop may spend before it "
+        "answers with what it has (default 900). 0 lifts the bound."
+    ),
+)
+@click.option(
+    "--skip-known-library",
+    is_flag=True,
+    help=(
+        "Do not analyze functions the signature database already identifies. "
+        "They are documented library code, already named by the symbol they "
+        "matched, and the most expensive thing in a run to rediscover."
+    ),
+)
+@click.option(
     "--transpile-only",
     default=None,
     metavar="ADDRESSES|FILE",
@@ -483,6 +528,10 @@ def analyze(
     max_prompt_chars: int | None,
     max_chunk_functions: int | None,
     max_output_tokens: int | None,
+    concurrency: int | None,
+    obfuscation_threshold: float | None,
+    deobfuscation_budget: int | None,
+    skip_known_library: bool,
     transpile_only: str | None,
     no_follow_callees: bool,
 ) -> None:
@@ -572,6 +621,20 @@ def analyze(
             formats=list(formats),
             transpile_addresses=transpile_addresses,
             transpile_follow_callees=not no_follow_callees,
+        ),
+        analysis=AnalysisConfig(
+            **(
+                {"obfuscation_threshold": obfuscation_threshold}
+                if obfuscation_threshold is not None
+                else {}
+            ),
+            **(
+                {"deobfuscation_time_budget": deobfuscation_budget or None}
+                if deobfuscation_budget is not None
+                else {}
+            ),
+            chunk_concurrency=concurrency,
+            skip_matched_signatures=skip_known_library,
         ),
         headless=headless,
         verbose=ctx.obj["verbose"],

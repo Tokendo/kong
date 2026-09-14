@@ -8,6 +8,7 @@ Tracks token usage and cost per call.  Supports both simple
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -96,15 +97,20 @@ class AnthropicClient:
         self._tokens_generated = 0
         self._generation_seconds = 0.0
         self._timed_calls = 0
+        #: One client serves every worker when chunks run concurrently, and
+        #: every counter below is a read-modify-write. The SDK itself is
+        #: thread-safe; these are not.
+        self._meter = threading.Lock()
 
     def _observe(self, message: Any, seconds: float) -> None:
         """Record how fast the endpoint generated one message."""
         generated = getattr(message.usage, "output_tokens", 0) or 0
         if generated <= 0 or seconds <= 0:
             return
-        self._tokens_generated += generated
-        self._generation_seconds += seconds
-        self._timed_calls += 1
+        with self._meter:
+            self._tokens_generated += generated
+            self._generation_seconds += seconds
+            self._timed_calls += 1
 
     def _budget_cap(self) -> int:
         """The largest output budget this endpoint can deliver before the deadline.
@@ -117,9 +123,10 @@ class AnthropicClient:
         reasoning in full. Until there are enough samples this is the module
         ceiling, i.e. no cap at all.
         """
-        if self._timed_calls < MIN_RATE_SAMPLES or self._generation_seconds <= 0:
-            return MAX_TOKENS_CAP
-        rate = self._tokens_generated / self._generation_seconds
+        with self._meter:
+            if self._timed_calls < MIN_RATE_SAMPLES or self._generation_seconds <= 0:
+                return MAX_TOKENS_CAP
+            rate = self._tokens_generated / self._generation_seconds
         return int(rate * self.timeout)
 
     def analyze_function(self, prompt: str, *, model: str | None = None) -> LLMResponse:
@@ -215,14 +222,18 @@ class AnthropicClient:
         tools: list[dict[str, Any]],
         tool_executor: ToolExecutor,
         max_rounds: int = 10,
+        max_seconds: float | None = None,
     ) -> LLMResponse:
         """Run an agentic tool-use loop.
 
         Sends the prompt with tool definitions.  When the model returns
         ``tool_use`` blocks, executes each tool via *tool_executor* and
         feeds results back.  Repeats until the model returns a final text
-        response or *max_rounds* is exhausted.
+        response, *max_rounds* is exhausted, or *max_seconds* of wall clock
+        have gone — see the OpenAI client for why the clock is needed as well
+        as the round count.
         """
+        started = time.monotonic()
         cached_system = [{
             "type": "text",
             "text": f"{system}\n\n{OUTPUT_SCHEMA}",
@@ -253,7 +264,16 @@ class AnthropicClient:
             self._observe(message, time.monotonic() - started)
             return message
 
-        for _ in range(max_rounds):
+        for round_number in range(max_rounds):
+            if max_seconds is not None and round_number > 0:
+                spent = time.monotonic() - started
+                if spent >= max_seconds:
+                    logger.warning(
+                        "%s tool loop stopped after %.0fs and %d rounds: past its "
+                        "%.0fs budget. Answering with what it has.",
+                        self.model, spent, round_number, max_seconds,
+                    )
+                    break
             message = call_with_budget(
                 send,
                 budget=self.max_tokens,
@@ -302,12 +322,13 @@ class AnthropicClient:
     def _record_usage(self, message: Any, model: str | None = None) -> None:
         effective_model = model or self.model
         usage = message.usage
-        mu = self.usage._get(effective_model)
-        mu.input_tokens += usage.input_tokens
-        mu.output_tokens += usage.output_tokens
-        mu.cache_creation_tokens += getattr(usage, "cache_creation_input_tokens", 0) or 0
-        mu.cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
-        mu.calls += 1
+        with self._meter:
+            mu = self.usage._get(effective_model)
+            mu.input_tokens += usage.input_tokens
+            mu.output_tokens += usage.output_tokens
+            mu.cache_creation_tokens += getattr(usage, "cache_creation_input_tokens", 0) or 0
+            mu.cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
+            mu.calls += 1
         logger.debug(
             "LLM [%s]: %d in / %d out / %d cache_write / %d cache_read tokens "
             "(total: %d calls, $%.4f)",

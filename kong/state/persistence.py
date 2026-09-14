@@ -34,7 +34,7 @@ STATE_NAME = "analysis_state.json"
 
 #: Bumped when the entry shape changes, so an old file is ignored rather than
 #: half-read into a shape that no longer matches.
-STATE_VERSION = 3
+STATE_VERSION = 4
 
 #: Read in chunks: a binary can be hundreds of megabytes and the hash is
 #: computed while the user is waiting for the run to start.
@@ -116,8 +116,15 @@ def save_state(
     results: dict[int, FunctionResult],
     output_dir: Path,
     binary: BinaryIdentity | None = None,
+    call_edges: list[tuple[int, int]] | None = None,
 ) -> Path:
-    """Write the results so far. Overwrites any earlier state."""
+    """Write the results so far. Overwrites any earlier state.
+
+    *call_edges* is the call graph triage read from Ghidra. It is saved because
+    it is the one thing a run learns that it cannot work out again from its own
+    output: parsing the exported C back only finds calls between functions that
+    were named, and loses every call into one that was skipped.
+    """
     entries = [
         {"address": addr, **{f: getattr(result, f) for f in _FIELDS}}
         for addr, result in sorted(results.items())
@@ -127,6 +134,8 @@ def save_state(
     if binary is not None:
         document["binary"] = binary.as_dict()
     document["functions"] = entries
+    if call_edges is not None:
+        document["call_edges"] = [[caller, callee] for caller, callee in call_edges]
 
     path = state_path(output_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,22 +149,19 @@ def save_state(
     return path
 
 
-def load_state(
+def _read_document(
     output_dir: Path, binary: BinaryIdentity | None = None,
-) -> dict[int, FunctionResult]:
-    """Read a previous run's results. Empty dict when there is nothing usable.
-
-    Pass *binary* to refuse a state file written for a different one.
-    """
+) -> dict | None:
+    """The state file's contents, or None when it is missing or unusable."""
     path = state_path(output_dir)
     if not path.exists():
-        return {}
+        return None
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Ignoring unreadable state file %s: %s", path, e)
-        return {}
+        return None
 
     version = data.get("version")
     if version != STATE_VERSION:
@@ -163,7 +169,7 @@ def load_state(
             "Ignoring state file %s: version %r, expected %d.",
             path, version, STATE_VERSION,
         )
-        return {}
+        return None
 
     if binary is not None and not binary.matches(data.get("binary")):
         stored = data.get("binary") or {}
@@ -171,7 +177,22 @@ def load_state(
             "Ignoring state file %s: it was written for %s, not %s.",
             path, stored.get("path", "another binary"), binary.path,
         )
+        return None
+
+    return data
+
+
+def load_state(
+    output_dir: Path, binary: BinaryIdentity | None = None,
+) -> dict[int, FunctionResult]:
+    """Read a previous run's results. Empty dict when there is nothing usable.
+
+    Pass *binary* to refuse a state file written for a different one.
+    """
+    data = _read_document(output_dir, binary)
+    if data is None:
         return {}
+    path = state_path(output_dir)
 
     results: dict[int, FunctionResult] = {}
     for entry in data.get("functions", []):
@@ -185,3 +206,24 @@ def load_state(
 
     logger.info("Loaded %d results from %s", len(results), path)
     return results
+
+
+def load_call_edges(
+    output_dir: Path, binary: BinaryIdentity | None = None,
+) -> list[tuple[int, int]]:
+    """Read the call graph a previous run saved. Empty when there is none.
+
+    Kept separate from `load_state` so a caller that only wants the results
+    does not pay to build the edge list, and so a state file written before
+    the graph was saved simply has none.
+    """
+    document = _read_document(output_dir, binary)
+    if document is None:
+        return []
+    edges: list[tuple[int, int]] = []
+    for pair in document.get("call_edges", []):
+        if isinstance(pair, list) and len(pair) == 2:
+            caller, callee = pair
+            if isinstance(caller, int) and isinstance(callee, int):
+                edges.append((caller, callee))
+    return edges

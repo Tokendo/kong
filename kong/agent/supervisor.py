@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 from kong.agent.analyzer import Analyzer, LLMClient, LLMResponse
@@ -22,7 +23,12 @@ from kong.agent.coherence import (
     Resolution,
     detect_conflicts,
 )
-from kong.agent.deobfuscator import Deobfuscator, classify_obfuscation
+from kong.agent.deobfuscator import (
+    Deobfuscator,
+    classify_obfuscation,
+    is_known_library_code,
+    obfuscation_verdict,
+)
 from kong.agent.events import Event, EventCallback, EventType, Phase
 from kong.agent.models import AnalysisStats, FunctionResult, PhaseFailure
 from kong.agent.queue import WorkItem, WorkQueue
@@ -31,13 +37,14 @@ from kong.agent.run_log import RunLog
 from kong.agent.signatures import SignatureDB
 from kong.state.persistence import (
     BinaryIdentity,
+    load_call_edges,
     load_state,
     save_state,
     state_path,
 )
-from kong.agent.triage import TriageAgent, TriageResult
+from kong.agent.triage import CallGraph, TriageAgent, TriageResult
 from kong.agent.type_recovery import StructAccumulator, apply_unified_structs
-from kong.config import KongConfig, RunStage
+from kong.config import KongConfig, LLMProvider, RunStage
 from kong.export.source import ExportData, export_source
 from kong.export.structured import export_json
 from kong.export.transpile import TargetLanguage, transpile_and_export
@@ -92,6 +99,10 @@ class Supervisor:
         #: and not only in events.log.
         self.phase_failures: list[PhaseFailure] = []
         self.triage_result: TriageResult | None = None
+        #: Whether this binary's obfuscation detections were believed. False
+        #: until the analysis phase has seen enough of the binary to judge;
+        #: see kong.agent.deobfuscator.obfuscation_verdict.
+        self._obfuscation_believed: bool = False
         self.binary_info: BinaryInfo | None = None
         self.functions: list[FunctionInfo] = []
         self.strings: list[StringEntry] = []
@@ -305,8 +316,18 @@ class Supervisor:
         """Persist results so a later run can skip what this one paid for."""
         with self._results_lock:
             snapshot = dict(self.results)
+        edges = (
+            self.triage_result.call_graph.edges()
+            if self.triage_result is not None
+            else None
+        )
         try:
-            save_state(snapshot, self.config.output.directory, self._identity())
+            save_state(
+                snapshot,
+                self.config.output.directory,
+                self._identity(),
+                call_edges=edges,
+            )
         except OSError:
             # Losing the checkpoint is not worth losing the run over.
             logger.warning("Could not write the analysis state file", exc_info=True)
@@ -867,6 +888,38 @@ class Supervisor:
             ),
         ))
 
+    def _call_graph(self) -> CallGraph | None:
+        """This run's call graph, or the one a previous run saved.
+
+        An export triggered without a triage of its own — from the TUI, or a
+        finishing pass over a saved draft — would otherwise write a document
+        with no edges in it at all.
+        """
+        if self.triage_result is not None:
+            return self.triage_result.call_graph
+        edges = load_call_edges(self.config.output.directory, self._identity())
+        if not edges:
+            return None
+        graph = CallGraph()
+        for caller, callee in edges:
+            graph.callees.setdefault(caller, []).append(callee)
+            graph.callers.setdefault(callee, []).append(caller)
+        logger.info("Loaded %d call edges from the saved state.", len(edges))
+        return graph
+
+    def _signature_matched_addresses(self) -> frozenset[int]:
+        """Addresses the signature database identified during triage.
+
+        Deliberately not "Ghidra gave it a name": on a resumed run that name is
+        Kong's own from the run before, so every function analysed once would
+        look like a documented library function.
+        """
+        if self.triage_result is None:
+            return frozenset()
+        return frozenset(
+            match.function_address for match in self.triage_result.signature_matches
+        )
+
     def _run_analysis(self) -> None:
         """Analyze functions in large chunks via sequential LLM calls."""
         self._emit(Event(
@@ -890,13 +943,22 @@ class Supervisor:
         all_items = self.queue.all_items()
         draft_items: list[tuple[WorkItem, str]] = []
         chunk_items: list[tuple[WorkItem, str]] = []
-        sequential_items: list[WorkItem] = []
+        sequential_items: list[tuple[WorkItem, list]] = []
         completed_count = 0
         draft_model = self._draft_model
         # A draft run owes the primary model nothing: every function it cannot
         # handle itself is held for the finishing pass instead of being sent
         # there now, which is what makes the two stages separable at all.
         drafting = self.config.stage is RunStage.DRAFT
+
+        # Read every pending function before dispatching any of it. The
+        # obfuscation decision cannot be taken one function at a time: the
+        # heuristics read structure, and a while(1) around a switch is both
+        # control-flow flattening and every hand-written state machine, so
+        # whether a hit means anything depends on how many of them there are.
+        pending: list[tuple[WorkItem, str, list]] = []
+        matched = self._signature_matched_addresses()
+        skip_matched = self.config.analysis.skip_matched_signatures
 
         for item in all_items:
             func = item.function
@@ -918,6 +980,22 @@ class Supervisor:
                 completed_count += 1
                 continue
 
+            if skip_matched and is_known_library_code(func.address, matched):
+                # A documented library function, already named by the symbol
+                # it matched. Paying a model to describe it again is the one
+                # cost in a run that buys nothing.
+                result = FunctionResult(
+                    address=func.address,
+                    original_name=func.name,
+                    name=func.name,
+                    skipped=True,
+                    skip_reason="identified by signature",
+                )
+                self._store_result(func.address, result)
+                self.stats.record_result(result)
+                completed_count += 1
+                continue
+
             if self.llm_client is None:
                 result = FunctionResult(
                     address=func.address,
@@ -931,9 +1009,39 @@ class Supervisor:
                 continue
 
             decompilation = self._get_decompilation(func.address)
-            techniques = classify_obfuscation(decompilation)
+            # Library code is where the heuristics misfire hardest and where
+            # the agentic loop has least to offer: the CRT is full of large
+            # dispatch loops, and they are already named and documented.
+            techniques = (
+                []
+                if is_known_library_code(func.address, matched)
+                else classify_obfuscation(decompilation)
+            )
+            pending.append((item, decompilation, techniques))
 
-            if techniques:
+        verdict = obfuscation_verdict(
+            flagged=sum(1 for _, _, t in pending if t),
+            total=len(pending),
+            threshold=self.config.analysis.obfuscation_threshold,
+        )
+        self._obfuscation_believed = verdict.believed
+        if verdict.flagged:
+            logger.info("Obfuscation: %s", verdict.describe())
+            self._emit(Event(
+                type=EventType.PHASE_START,
+                phase=Phase.ANALYSIS,
+                message=verdict.describe(),
+                data={
+                    "flagged": verdict.flagged,
+                    "total": verdict.total,
+                    "believed": verdict.believed,
+                },
+            ))
+
+        for item, decompilation, techniques in pending:
+            func = item.function
+
+            if techniques and verdict.believed:
                 # Obfuscated code goes to the strong model directly: the draft
                 # would be re-analyzed whatever it answered, and the agentic
                 # deobfuscation loop is the part a small model handles worst.
@@ -944,7 +1052,7 @@ class Supervisor:
                     )
                     self._result_version += 1
                     continue
-                sequential_items.append(item)
+                sequential_items.append((item, techniques))
                 continue
 
             entry = (item, normalize(decompilation))
@@ -987,7 +1095,7 @@ class Supervisor:
             self._analyze_chunks(chunk_items, completed_count)
             completed_count += len(chunk_items)
 
-        for item in sequential_items:
+        for item, techniques in sequential_items:
             self._wait_if_paused()
             completed_count += 1
             func = item.function
@@ -1004,7 +1112,7 @@ class Supervisor:
                 },
             ))
             try:
-                result = self._analyze_function_sequential(item)
+                result = self._analyze_function_sequential(item, techniques)
             except Exception as e:
                 err_msg = _clean_api_error(e)
                 logger.exception(
@@ -1135,6 +1243,124 @@ class Supervisor:
 
         return chunks, oversized
 
+    #: Chunk calls in flight when the provider is a hosted API. Local
+    #: endpoints keep to one: they are already saturating the machine Kong
+    #: runs on, and a second call in flight only makes both slower.
+    HOSTED_CHUNK_CONCURRENCY = 4
+
+    def _chunk_concurrency(self) -> int:
+        """How many chunk calls may be in flight at once.
+
+        Safe because of how the queue is built: it is ordered bottom-up by
+        call-graph depth, and functions at the same depth cannot be each
+        other's callees, so nothing in one chunk is waiting on a name another
+        chunk is about to produce. Only the sending is concurrent — results are
+        written back on this thread, in chunk order.
+        """
+        configured = self.config.analysis.chunk_concurrency
+        if configured is not None:
+            return max(1, configured)
+        if self.config.llm.provider is LLMProvider.CUSTOM:
+            return 1
+        return self.HOSTED_CHUNK_CONCURRENCY
+
+    def _send_one(
+        self, prompt: str, model: str | None, limits: ModelLimits,
+    ) -> tuple[list[LLMResponse], str | None]:
+        """One batch call, retried. Returns its responses, or the last error.
+
+        The retry is for the transient half of the failures — a 500, a reset
+        connection — which used to fail every function in the chunk on the
+        first try. What the endpoint genuinely objects to fails again here and
+        is left to `_recover_chunk` to isolate.
+        """
+        assert self.llm_client is not None
+        attempts = max(1, self.config.analysis.chunk_attempts)
+        error = "no attempt made"
+        for attempt in range(1, attempts + 1):
+            try:
+                responses = self.llm_client.analyze_function_batch(
+                    prompt, model=model, max_tokens=limits.max_output_tokens,
+                )
+            except Exception as e:
+                error = _clean_api_error(e)
+                if attempt < attempts:
+                    logger.warning(
+                        "Chunk call failed (attempt %d/%d): %s. Retrying.",
+                        attempt, attempts, error,
+                    )
+                continue
+            return responses, None
+        return [], error
+
+    def _send_prompts(
+        self, prompts: list[str], model: str | None, limits: ModelLimits,
+    ) -> list[tuple[list[LLMResponse], str | None]]:
+        """Send a wave of prompts, concurrently when more than one is allowed.
+
+        Results come back in the order the prompts were given, whatever order
+        they actually finished in, so a run's events and its state file do not
+        depend on which call the endpoint answered first.
+        """
+        if len(prompts) == 1:
+            return [self._send_one(prompts[0], model, limits)]
+
+        with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+            futures = [
+                pool.submit(self._send_one, prompt, model, limits)
+                for prompt in prompts
+            ]
+            return [future.result() for future in futures]
+
+    def _recover_chunk(
+        self,
+        chunk: list[tuple[WorkItem, str]],
+        model: str | None,
+        limits: ModelLimits,
+        error: str,
+    ) -> tuple[list[LLMResponse], dict[int, str]]:
+        """Salvage a failed chunk by halving it, down to single functions.
+
+        A chunk call is one request for many functions, so one transient error
+        used to fail every function in it at once — which is why failures
+        arrived in bursts of eight or sixteen. Halving finds the function the
+        endpoint actually objects to, usually an oversized one, and keeps the
+        rest of the chunk.
+
+        Returns the responses recovered, and the addresses that could not be,
+        each with the error that stopped it.
+        """
+        if len(chunk) == 1:
+            return [], {chunk[0][0].function.address: f"Chunk call failed: {error}"}
+
+        middle = len(chunk) // 2
+        responses: list[LLMResponse] = []
+        failures: dict[int, str] = {}
+        for half in (chunk[:middle], chunk[middle:]):
+            prompt = self._build_chunk_prompt(half, limits=limits)
+            got, half_error = self._send_one(prompt, model, limits)
+            if half_error is None:
+                responses.extend(got)
+                continue
+            logger.warning(
+                "Half of %d functions also failed: %s. Splitting again.",
+                len(half), half_error,
+            )
+            deeper, deeper_failures = self._recover_chunk(
+                half, model, limits, half_error,
+            )
+            responses.extend(deeper)
+            failures.update(deeper_failures)
+
+        if failures:
+            logger.warning(
+                "Recovered %d of %d functions from the failed chunk.",
+                len(chunk) - len(failures), len(chunk),
+            )
+        else:
+            logger.info("Recovered all %d functions from the failed chunk.", len(chunk))
+        return responses, failures
+
     def _analyze_chunks(
         self,
         items: list[tuple[WorkItem, str]],
@@ -1178,131 +1404,136 @@ class Supervisor:
                 ),
             )
 
-        for chunk_num, chunk in enumerate(chunks, start=1):
+        concurrency = self._chunk_concurrency()
+        if concurrency > 1 and total_chunks > 1:
+            logger.info(
+                "Sending %d chunks %d at a time. The queue is ordered bottom-up "
+                "and functions at the same depth do not depend on each other.",
+                total_chunks, concurrency,
+            )
 
-            for idx, (item, _) in enumerate(chunk):
-                func = item.function
-                self._emit(Event(
-                    type=EventType.FUNCTION_START,
-                    phase=Phase.ANALYSIS,
-                    message=f"Analyzing {func.name} ({func.address_hex})...",
-                    data={
-                        "address": func.address,
-                        "name": func.name,
-                        "size": func.size,
-                        "depth": item.depth,
-                        "model": model,
-                        "progress": f"{completed_base + processed + idx + 1}/{self.queue.total}",
-                    },
-                ))
+        for wave_start in range(0, total_chunks, concurrency):
+            wave = chunks[wave_start:wave_start + concurrency]
+
+            offset = 0
+            for chunk in wave:
+                for idx, (item, _) in enumerate(chunk):
+                    func = item.function
+                    self._emit(Event(
+                        type=EventType.FUNCTION_START,
+                        phase=Phase.ANALYSIS,
+                        message=f"Analyzing {func.name} ({func.address_hex})...",
+                        data={
+                            "address": func.address,
+                            "name": func.name,
+                            "size": func.size,
+                            "depth": item.depth,
+                            "model": model,
+                            "progress": (
+                                f"{completed_base + processed + offset + idx + 1}"
+                                f"/{self.queue.total}"
+                            ),
+                        },
+                    ))
+                offset += len(chunk)
 
             self._wait_if_paused()
 
-            logger.info(
-                "Sending chunk %d/%d (%d functions) to LLM...",
-                chunk_num, total_chunks, len(chunk),
-            )
-
-            prompt = self._build_chunk_prompt(chunk, limits=limits)
-            logger.info(
-                "Chunk %d/%d prompt: %d chars (%d functions).",
-                chunk_num, total_chunks, len(prompt), len(chunk),
-            )
-
-            try:
-                responses = self.llm_client.analyze_function_batch(
-                    prompt,
-                    model=model,
-                    max_tokens=limits.max_output_tokens,
+            # Prompts are built here, on the one thread that owns self.results:
+            # the preamble names functions analyzed so far, and a worker
+            # reading it while this loop writes to it is a race for nothing.
+            prompts = [self._build_chunk_prompt(chunk, limits=limits) for chunk in wave]
+            for offset_in_wave, (chunk, prompt) in enumerate(zip(wave, prompts)):
+                logger.info(
+                    "Chunk %d/%d prompt: %d chars (%d functions).",
+                    wave_start + offset_in_wave + 1, total_chunks, len(prompt), len(chunk),
                 )
-            except Exception as e:
-                err_msg = _clean_api_error(e)
-                logger.exception("Chunk %d/%d failed: %s", chunk_num, total_chunks, err_msg)
+
+            sent = self._send_prompts(prompts, model, limits)
+
+            for offset_in_wave, (chunk, outcome) in enumerate(zip(wave, sent)):
+                chunk_num = wave_start + offset_in_wave + 1
+                responses, error = outcome
+                failures: dict[int, str] = {}
+
+                if error is not None:
+                    logger.warning(
+                        "Chunk %d/%d failed: %s. Retrying it in halves rather than "
+                        "failing all %d functions on one call.",
+                        chunk_num, total_chunks, error, len(chunk),
+                    )
+                    responses, failures = self._recover_chunk(chunk, model, limits, error)
+
+                by_addr = {r.address: r for r in responses if r.address}
+
+                logger.info(
+                    "Chunk %d/%d: LLM returned %d responses, %d with valid addresses "
+                    "(chunk has %d functions).",
+                    chunk_num, total_chunks, len(responses), len(by_addr), len(chunk),
+                )
+
+                missing = [
+                    item.function.address
+                    for item, _ in chunk
+                    if item.function.address not in by_addr
+                ]
+                if missing:
+                    logger.warning(
+                        "Chunk %d/%d: no response for %s; the model answered for %s.",
+                        chunk_num, total_chunks,
+                        ", ".join(f"0x{a:08x}" for a in missing),
+                        ", ".join(f"0x{a:08x}" for a in sorted(by_addr))
+                        or "no usable address",
+                    )
+
+                matched = 0
                 for item, _ in chunk:
                     func = item.function
-                    result = FunctionResult(
-                        address=func.address,
-                        original_name=func.name,
-                        error=f"Chunk call failed: {err_msg}",
-                        model=model,
-                    )
-                    self._emit(Event(
-                        type=EventType.FUNCTION_ERROR,
-                        phase=Phase.ANALYSIS,
-                        message=f"Error analyzing {func.name}: {err_msg}",
-                        data={"address": func.address, "error": err_msg},
-                    ))
+                    response = by_addr.get(func.address)
+
+                    if response and response.name:
+                        sig_applied = analyzer._write_back(func.address, response)
+                        result = FunctionResult(
+                            address=func.address,
+                            original_name=func.name,
+                            name=response.name,
+                            signature=response.signature,
+                            confidence=response.confidence,
+                            classification=response.classification,
+                            comments=response.comments,
+                            reasoning=response.reasoning,
+                            model=model,
+                            llm_calls=1,
+                            signature_applied=sig_applied,
+                            struct_proposals=response.struct_proposals,
+                        )
+                        matched += 1
+                    else:
+                        reason = failures.get(
+                            func.address, "No matching response from LLM"
+                        )
+                        if func.address not in failures and response:
+                            reason = response.reasoning or "Empty name in response"
+                        result = FunctionResult(
+                            address=func.address,
+                            original_name=func.name,
+                            error=reason,
+                            model=model,
+                        )
+                        self._emit(Event(
+                            type=EventType.FUNCTION_ERROR,
+                            phase=Phase.ANALYSIS,
+                            message=f"No analysis for {func.name}",
+                            data={"address": func.address, "error": reason},
+                        ))
+
                     self._record_analysis_result(func, result)
-                continue
 
-            by_addr = {r.address: r for r in responses if r.address}
-
-            logger.info(
-                "Chunk %d/%d: LLM returned %d responses, %d with valid addresses "
-                "(chunk has %d functions).",
-                chunk_num, total_chunks, len(responses), len(by_addr), len(chunk),
-            )
-
-            missing = [
-                item.function.address
-                for item, _ in chunk
-                if item.function.address not in by_addr
-            ]
-            if missing:
-                logger.warning(
-                    "Chunk %d/%d: no response for %s; the model answered for %s.",
-                    chunk_num, total_chunks,
-                    ", ".join(f"0x{a:08x}" for a in missing),
-                    ", ".join(f"0x{a:08x}" for a in sorted(by_addr))
-                    or "no usable address",
+                logger.info(
+                    "Chunk %d/%d complete: %d/%d functions matched.",
+                    chunk_num, total_chunks, matched, len(chunk),
                 )
-
-            matched = 0
-            for item, _ in chunk:
-                func = item.function
-                response = by_addr.get(func.address)
-
-                if response and response.name:
-                    sig_applied = analyzer._write_back(func.address, response)
-                    result = FunctionResult(
-                        address=func.address,
-                        original_name=func.name,
-                        name=response.name,
-                        signature=response.signature,
-                        confidence=response.confidence,
-                        classification=response.classification,
-                        comments=response.comments,
-                        reasoning=response.reasoning,
-                        model=model,
-                        llm_calls=1,
-                        signature_applied=sig_applied,
-                        struct_proposals=response.struct_proposals,
-                    )
-                    matched += 1
-                else:
-                    reason = "No matching response from LLM"
-                    if response:
-                        reason = response.reasoning or "Empty name in response"
-                    result = FunctionResult(
-                        address=func.address,
-                        original_name=func.name,
-                        error=reason,
-                        model=model,
-                    )
-                    self._emit(Event(
-                        type=EventType.FUNCTION_ERROR,
-                        phase=Phase.ANALYSIS,
-                        message=f"No analysis for {func.name}",
-                        data={"address": func.address, "error": reason},
-                    ))
-
-                self._record_analysis_result(func, result)
-
-            logger.info(
-                "Chunk %d/%d complete: %d/%d functions matched.",
-                chunk_num, total_chunks, matched, len(chunk),
-            )
-            processed += len(chunk)
+                processed += len(chunk)
 
     def _build_chunk_prompt(
         self,
@@ -1358,16 +1589,28 @@ class Supervisor:
 
         return "\n".join(parts)
 
-    def _analyze_function_sequential(self, item: WorkItem) -> FunctionResult:
-        """Analyze a single function sequentially (used for obfuscated functions)."""
+    def _analyze_function_sequential(
+        self, item: WorkItem, techniques: list | None = None,
+    ) -> FunctionResult:
+        """Analyze a single function sequentially (used for obfuscated functions).
+
+        *techniques* is what the analysis phase already decided about this
+        function. Left out — the second pass re-reads functions for reasons
+        that have nothing to do with obfuscation — the binary-level verdict
+        stands in, so a run that dismissed the heuristics does not quietly
+        re-enter the agentic loop one function at a time.
+        """
         assert self.llm_client is not None
         func = item.function
+        if techniques is None and not self._obfuscation_believed:
+            techniques = []
         deobfuscator = Deobfuscator(self.client, self.llm_client)
         analyzer = Analyzer(
             self.client,
             self.llm_client,
             deobfuscator=deobfuscator,
             max_prompt_chars=self._get_effective_limits().max_prompt_chars,
+            deobfuscation_time_budget=self.config.analysis.deobfuscation_time_budget,
         )
         result = analyzer.analyze(
             item,
@@ -1375,6 +1618,7 @@ class Supervisor:
             known_results=self.results,
             strings=self.strings,
             model=self._primary_model,
+            techniques=techniques,
         )
         result.model = self._primary_model
 
@@ -1875,6 +2119,17 @@ class Supervisor:
             ))
             return
 
+        if synthesis_result.partial:
+            # Some groups came back and some did not. The result is real and
+            # worth applying; the document should still say it is incomplete.
+            message = (
+                f"Synthesis incomplete: {synthesis_result.failed_passes} of "
+                f"{synthesis_result.passes + synthesis_result.failed_passes} "
+                f"passes failed."
+            )
+            logger.warning(message)
+            self._record_phase_failure(Phase.SYNTHESIS, RuntimeError(message))
+
         if synthesis_result.globals:
             self._emit(Event(
                 type=EventType.SYNTHESIS_GLOBALS_UNIFIED,
@@ -1984,7 +2239,7 @@ class Supervisor:
             duration_seconds=self.stats.duration_seconds,
             provider=self.config.llm.provider,
             phase_failures=list(self.phase_failures),
-            call_graph=self.triage_result.call_graph if self.triage_result else None,
+            call_graph=self._call_graph(),
         )
 
         formats = self.config.output.formats

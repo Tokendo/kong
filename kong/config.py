@@ -116,10 +116,42 @@ class LLMConfig:
 
 
 @dataclass
+class AnalysisConfig:
+    """How the analysis phase spends its time, as opposed to where it sends it."""
+
+    #: Share of a binary's functions that must trip the obfuscation heuristics
+    #: before the expensive agentic deobfuscation loop is used at all. The
+    #: heuristics read structure, and a `while(1)` around a `switch` is both
+    #: control-flow flattening and every hand-written state machine, so on a
+    #: clean binary they fire on the CRT and cost hours. A protector is applied
+    #: wholesale, so its signature is a large share, not a handful. 0 believes
+    #: every detection, which is the old behaviour.
+    obfuscation_threshold: float = 0.05
+    #: Wall clock one function's deobfuscation loop may spend. None lifts the
+    #: bound, which is how a single function once cost 1h48 and produced
+    #: nothing.
+    deobfuscation_time_budget: float | None = 900.0
+    #: Chunk calls in flight at once. The work queue is ordered bottom-up and
+    #: functions at the same depth are independent, so the calls do not have to
+    #: wait for each other. None picks a default from the provider: several for
+    #: a hosted API, one for a local endpoint that is already using the machine
+    #: it runs on.
+    chunk_concurrency: int | None = None
+    #: Attempts on a chunk call before its functions are split and retried
+    #: individually. A chunk failure used to fail every function in it at once.
+    chunk_attempts: int = 2
+    #: Skip functions the signature database already identifies, instead of
+    #: paying a model to name a documented library function. Off by default:
+    #: the descriptions are still worth something to some readers.
+    skip_matched_signatures: bool = False
+
+
+@dataclass
 class KongConfig:
     ghidra: GhidraConfig = field(default_factory=GhidraConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     headless: bool = False
     verbose: bool = False
     #: Which half of the analysis this run does. See RunStage.

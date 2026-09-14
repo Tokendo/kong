@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from typing import Any
 
@@ -115,15 +116,20 @@ class OpenAIClient:
         self._tokens_generated = 0
         self._generation_seconds = 0.0
         self._timed_calls = 0
+        #: One client serves every worker when chunks run concurrently, and
+        #: every counter below is a read-modify-write. The SDK itself is
+        #: thread-safe; these are not.
+        self._meter = threading.Lock()
 
     def _observe(self, response: Any, seconds: float) -> None:
         """Record how fast the endpoint generated one completion."""
         generated = getattr(response.usage, "completion_tokens", 0) or 0
         if generated <= 0 or seconds <= 0:
             return
-        self._tokens_generated += generated
-        self._generation_seconds += seconds
-        self._timed_calls += 1
+        with self._meter:
+            self._tokens_generated += generated
+            self._generation_seconds += seconds
+            self._timed_calls += 1
 
     def _budget_cap(self) -> int:
         """The largest output budget this endpoint can deliver before the deadline.
@@ -140,9 +146,10 @@ class OpenAIClient:
         day knows which this is. Until there are enough samples the cap is the
         module ceiling, i.e. no cap at all.
         """
-        if self._timed_calls < MIN_RATE_SAMPLES or self._generation_seconds <= 0:
-            return MAX_TOKENS_CAP
-        rate = self._tokens_generated / self._generation_seconds
+        with self._meter:
+            if self._timed_calls < MIN_RATE_SAMPLES or self._generation_seconds <= 0:
+                return MAX_TOKENS_CAP
+            rate = self._tokens_generated / self._generation_seconds
         return int(rate * self.timeout)
 
     def analyze_function(self, prompt: str, *, model: str | None = None) -> LLMResponse:
@@ -228,14 +235,22 @@ class OpenAIClient:
         tools: list[dict[str, Any]],
         tool_executor: ToolExecutor,
         max_rounds: int = 10,
+        max_seconds: float | None = None,
     ) -> LLMResponse:
         """Run an agentic tool-use loop.
 
         Sends the prompt with tool definitions.  When the model returns
         tool_calls, executes each tool via *tool_executor* and feeds results
-        back.  Repeats until the model returns a final text response or
-        *max_rounds* is exhausted.
+        back.  Repeats until the model returns a final text response,
+        *max_rounds* is exhausted, or *max_seconds* of wall clock have gone.
+
+        The clock matters as much as the round count: ten rounds against a
+        slow endpoint, each allowed a full request deadline and its retries,
+        is hours on one function. `max_seconds` stops the loop between rounds
+        and answers with whatever it has, which is a named function rather
+        than an abandoned one.
         """
+        started = time.monotonic()
         openai_tools = _convert_tools_to_openai(tools)
 
         messages: list[dict[str, Any]] = [
@@ -264,7 +279,16 @@ class OpenAIClient:
             self._observe(response, time.monotonic() - started)
             return response
 
-        for _ in range(max_rounds):
+        for round_number in range(max_rounds):
+            if max_seconds is not None and round_number > 0:
+                spent = time.monotonic() - started
+                if spent >= max_seconds:
+                    logger.warning(
+                        "%s tool loop stopped after %.0fs and %d rounds: past its "
+                        "%.0fs budget. Answering with what it has.",
+                        self.model, spent, round_number, max_seconds,
+                    )
+                    break
             response = call_with_budget(
                 send,
                 budget=self.max_tokens,
@@ -325,16 +349,17 @@ class OpenAIClient:
     def _record_usage(self, response: Any, model: str | None = None) -> None:
         effective_model = model or self.model
         usage = response.usage
-        mu = self.usage._get(effective_model)
-        mu.input_tokens += usage.prompt_tokens
-        mu.output_tokens += usage.completion_tokens
         cached = getattr(
             getattr(usage, "prompt_tokens_details", None),
             "cached_tokens",
             0,
         ) or 0
-        mu.cache_read_tokens += cached
-        mu.calls += 1
+        with self._meter:
+            mu = self.usage._get(effective_model)
+            mu.input_tokens += usage.prompt_tokens
+            mu.output_tokens += usage.completion_tokens
+            mu.cache_read_tokens += cached
+            mu.calls += 1
         logger.debug(
             "LLM [%s]: %d in / %d out / %d cached tokens "
             "(total: %d calls, $%.4f)",

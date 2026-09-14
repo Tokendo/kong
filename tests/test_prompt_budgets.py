@@ -217,10 +217,20 @@ class _FakeResponse:
 
 class _RecordingLLM:
     def __init__(self) -> None:
-        self.last_prompt = ""
+        self.prompts: list[str] = []
+
+    @property
+    def last_prompt(self) -> str:
+        return self.prompts[-1] if self.prompts else ""
+
+    @property
+    def every_prompt(self) -> str:
+        """Synthesis sends one call per group, so a claim about "the prompt"
+        is now a claim about all of them together."""
+        return "\n".join(self.prompts)
 
     def analyze_function(self, prompt: str, *, model: str | None = None):
-        self.last_prompt = prompt
+        self.prompts.append(prompt)
         return _FakeResponse()
 
 
@@ -315,7 +325,8 @@ class TestSynthesisPromptBudget:
 
         synthesizer.synthesize(results, decompilations)
 
-        assert "analyzed_function_17" in llm.last_prompt
+        # Sent first, in the group that carries the most shared structure.
+        assert "analyzed_function_17" in llm.prompts[0]
 
 
 class TestSupervisorWiring:
