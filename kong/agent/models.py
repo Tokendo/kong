@@ -98,6 +98,11 @@ class FunctionResult:
     skipped: bool = False
     skip_reason: str = ""
     signature_applied: bool = False
+    #: The body sent to the model was cut down to fit the prompt budget, so
+    #: this reading was taken from part of the function. Rare, and worth
+    #: carrying into every artefact: it is the difference between a name the
+    #: model chose from the whole function and one it chose from the start.
+    truncated: bool = False
     struct_proposals: list[StructProposal] = field(default_factory=list)
     obfuscation_techniques: list[str] = field(default_factory=list)
     deobfuscation_tool_calls: int = 0

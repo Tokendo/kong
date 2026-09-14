@@ -481,6 +481,15 @@ def _print_final_stats(supervisor: Supervisor, llm_client: LLMClient) -> None:
     ),
 )
 @click.option(
+    "--no-truncate",
+    is_flag=True,
+    help=(
+        "Leave a function whose body is over the prompt budget unanalyzed, "
+        "instead of sending it cut down with the fact marked. Keeps the hole "
+        "rather than a reading taken from part of a body."
+    ),
+)
+@click.option(
     "--skip-known-library",
     is_flag=True,
     help=(
@@ -531,6 +540,7 @@ def analyze(
     concurrency: int | None,
     obfuscation_threshold: float | None,
     deobfuscation_budget: int | None,
+    no_truncate: bool,
     skip_known_library: bool,
     transpile_only: str | None,
     no_follow_callees: bool,
@@ -634,6 +644,7 @@ def analyze(
                 else {}
             ),
             chunk_concurrency=concurrency,
+            truncate_oversized=not no_truncate,
             skip_matched_signatures=skip_known_library,
         ),
         headless=headless,

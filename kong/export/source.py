@@ -86,8 +86,13 @@ def _format_function(result: FunctionResult, decompilation: str) -> str:
         f" * @confidence {result.confidence}%",
         f" * @classification {result.classification}",
         f" * @address 0x{result.address:08x}",
-        " */",
     ])
+    if result.truncated:
+        lines.append(
+            " * @warning Read from a truncated body: this function was over the "
+            "run's prompt budget."
+        )
+    lines.append(" */")
     lines.append(decompilation)
     return "\n".join(lines)
 

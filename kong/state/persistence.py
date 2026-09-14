@@ -103,6 +103,7 @@ _FIELDS = (
     "skipped",
     "skip_reason",
     "signature_applied",
+    "truncated",
     "obfuscation_techniques",
     "deobfuscation_tool_calls",
 )

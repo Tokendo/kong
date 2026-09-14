@@ -12,6 +12,7 @@ from kong.agent.analyzer import LLMResponse
 from kong.agent.coherence import REPORT_NAME
 from kong.agent.events import EventType, Phase
 from kong.agent.models import AnalysisStats, FunctionResult
+from kong.agent.queue import WorkItem
 from kong.agent.supervisor import Supervisor
 from kong.agent.triage import CallGraph
 from kong.config import KongConfig, LLMConfig, LLMProvider, OutputConfig, RunStage
@@ -689,7 +690,10 @@ class TestLimitedContextChunking:
         assert "resolved_name_number_4999" in prompt  # newest kept
         assert len(prompt) <= sup._known_functions_budget() + 500
 
-    def test_function_larger_than_the_budget_is_reported_not_sent(self, tmp_path):
+    def _run_with_one_huge_function(self, tmp_path, **analysis):
+        """0x2000's body is far past the window; 0x1000's is ordinary."""
+        from kong.config import AnalysisConfig
+
         funcs = [_func(0x1000, "FUN_1000", size=64), _func(0x2000, "FUN_2000", size=64)]
         client = _make_client(functions=funcs)
 
@@ -698,6 +702,7 @@ class TestLimitedContextChunking:
 
         client.get_decompilation.side_effect = decompilation
         config = _small_context_config(tmp_path)
+        config.analysis = AnalysisConfig(**analysis)
 
         mock_llm = MagicMock()
         mock_llm.analyze_function_batch.side_effect = _batch_response_with_addresses
@@ -709,13 +714,120 @@ class TestLimitedContextChunking:
         events = []
         sup.on_event(events.append)
         sup.run()
-
         prompts = [c[0][0] for c in mock_llm.analyze_function_batch.call_args_list]
+        return sup, events, prompts
+
+    def test_an_oversized_function_is_cut_down_and_still_analyzed(self, tmp_path):
+        """A body nobody sends is a function the analysis says nothing about."""
+        sup, _, prompts = self._run_with_one_huge_function(tmp_path)
+
+        assert any("0x00002000" in p for p in prompts)
+        assert sup.results[0x2000].name
+        assert sup.results[0x2000].truncated is True
+        assert not sup.results[0x2000].error
+
+    def test_the_cut_is_announced_inside_the_prompt(self, tmp_path):
+        """The model has to know it is reading part of a function."""
+        _, _, prompts = self._run_with_one_huge_function(tmp_path)
+
+        sent = next(p for p in prompts if "0x00002000" in p)
+        assert "TRUNCATED" in sent
+        assert "characters shown" in sent
+
+    def test_truncating_still_respects_the_budget(self, tmp_path):
+        """The whole point of the budget: a small window is never overrun."""
+        _, _, prompts = self._run_with_one_huge_function(tmp_path)
+
+        assert max(len(p) for p in prompts) <= 8000
+
+    def test_an_ordinary_function_is_not_marked_truncated(self, tmp_path):
+        sup, _, _ = self._run_with_one_huge_function(tmp_path)
+
+        assert sup.results[0x1000].truncated is False
+
+    def test_the_rest_of_the_run_carries_on(self, tmp_path):
+        sup, _, _ = self._run_with_one_huge_function(tmp_path)
+
+        assert sup.results[0x1000].name
+
+    def test_with_truncation_off_it_is_reported_not_sent(self, tmp_path):
+        sup, events, prompts = self._run_with_one_huge_function(
+            tmp_path, truncate_oversized=False,
+        )
+
         assert all("0x00002000" not in p for p in prompts)
         assert "prompt budget" in sup.results[0x2000].error
         assert sup.results[0x1000].name  # the rest of the run continues
         errors = [e for e in events if e.type == EventType.FUNCTION_ERROR]
         assert any(e.data["address"] == 0x2000 for e in errors)
+
+    def test_the_refusal_names_the_room_actually_left(self, tmp_path):
+        """Naming the configured budget sent readers to a number that still failed.
+
+        The scaffolding and the names preamble come out of it first, so on the
+        FA18 run the message said 50000 when 44939 was the real allowance.
+        """
+        sup, _, _ = self._run_with_one_huge_function(
+            tmp_path, truncate_oversized=False,
+        )
+        error = sup.results[0x2000].error
+
+        assert "are left for a function body" in error
+        assert "Raise --max-prompt-chars to at least" in error
+
+    def _splitter(self, tmp_path, max_prompt_chars, **analysis):
+        from kong.config import AnalysisConfig
+
+        config = _small_context_config(tmp_path, max_prompt_chars=max_prompt_chars)
+        config.analysis = AnalysisConfig(**analysis)
+        sup = Supervisor(_make_client(), config, llm_client=MagicMock())
+        sup.binary_info = BinaryInfo(
+            arch="x86", format="PE", endianness="little", word_size=4,
+            compiler="windows", name="FA18.exe",
+        )
+        return sup
+
+    def test_the_fa18_dispatch_tick_now_gets_analyzed(self, tmp_path):
+        """The real case: 57876 chars of body against a 50000 char budget.
+
+        It is the binary's most connected function, and the run's only failure
+        was that nothing was ever sent for it.
+        """
+        sup = self._splitter(tmp_path, 50_000)
+        item = WorkItem(function=_func(0x41CC50, "FUN_0041cc50", size=9000))
+        body = "  entity->state = dispatch(entity, script);\n" * 1320
+
+        chunks, unanalyzable = sup._split_into_chunks([(item, body)])
+
+        assert len(body) > 50_000
+        assert unanalyzable == []
+        assert len(chunks) == 1
+        assert chunks[0].truncated == frozenset({0x41CC50})
+        assert chunks[0].preamble is False
+
+    def test_a_solo_function_gets_the_preamble_reserve_back(self, tmp_path):
+        """A tenth of the budget is reserved for names it does not need alone."""
+        sup = self._splitter(tmp_path, 50_000)
+        item = WorkItem(function=_func(0x41CC50, "FUN_0041cc50", size=9000))
+        # Over the shared allowance (~44.9k) but under the solo one (~49.9k).
+        body = "x" * 47_000
+
+        chunks, unanalyzable = sup._split_into_chunks([(item, body)])
+
+        assert unanalyzable == []
+        assert chunks[0].truncated == frozenset()   # it fitted whole
+        assert chunks[0].preamble is False
+
+    def test_the_prompt_for_a_truncated_function_still_fits(self, tmp_path):
+        sup = self._splitter(tmp_path, 50_000)
+        item = WorkItem(function=_func(0x41CC50, "FUN_0041cc50", size=9000))
+
+        chunks, _ = sup._split_into_chunks([(item, "y" * 200_000)])
+        prompt = sup._build_chunk_prompt(
+            chunks[0].entries, preamble=chunks[0].preamble,
+        )
+
+        assert len(prompt) <= 50_000
 
     def test_budget_smaller_than_the_scaffolding_is_rejected(self, tmp_path):
         config = _small_context_config(tmp_path, max_prompt_chars=50)

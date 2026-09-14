@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 from kong.agent.analyzer import Analyzer, LLMClient, LLMResponse
 from kong.agent.coherence import (
@@ -69,6 +69,28 @@ def _clean_api_error(exc: Exception) -> str:
     if isinstance(exc, openai.APIStatusError):
         return f"HTTP {exc.status_code}: {exc.response.reason_phrase}"
     return str(exc)[:200]
+
+
+@dataclass
+class Chunk:
+    """One batch call's worth of functions, and what is unusual about it.
+
+    Most chunks are a handful of functions sharing a call. The two flags are
+    for the odd one out: a function too large to share goes alone, without the
+    names preamble, and if it does not fit even then its body is cut down and
+    the fact recorded, so nothing downstream mistakes a partial reading for a
+    complete one.
+    """
+
+    entries: list[tuple[WorkItem, str]]
+    preamble: bool = True
+    truncated: frozenset[int] = frozenset()
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __iter__(self):
+        return iter(self.entries)
 
 
 class Supervisor:
@@ -1180,68 +1202,134 @@ class Supervisor:
         limits = limits or self._get_effective_limits()
         return max(0, limits.max_prompt_chars // 10)
 
+    @staticmethod
+    def _chunk_entry(item: WorkItem, decompilation: str) -> str:
+        """One function as it appears in a chunk prompt."""
+        func = item.function
+        return (
+            f"### 0x{func.address:08x}: {func.name} ({func.size} bytes)\n"
+            f"```c\n{decompilation}\n```\n\n"
+        )
+
     def _split_into_chunks(
         self,
         items: list[tuple[WorkItem, str]],
         limits: ModelLimits | None = None,
-    ) -> tuple[list[list[tuple[WorkItem, str]]], list[tuple[WorkItem, int]]]:
+    ) -> tuple[list[Chunk], list[tuple[WorkItem, str]]]:
         """Split items into chunks by building the actual prompt and measuring size.
 
-        Returns the chunks plus the items too large to fit in a chunk of their
-        own, as ``(item, entry_length)`` pairs.
+        A function too large to share a call is not therefore too large to
+        analyze. It goes in a chunk of its own, which needs no room reserved
+        for the names preamble — that list is a convenience, and on a solo call
+        it is worth more as body. Only when a function does not fit even then
+        is it truncated, or, if the run forbids that, reported unanalyzed.
+
+        Returns the chunks, and the functions nothing could be sent for, as
+        ``(item, reason)`` pairs.
         """
         assert self.binary_info is not None
 
         limits = limits or self._get_effective_limits()
         preamble_budget = self._known_functions_budget(limits)
 
-        overhead = self._build_chunk_prompt([], limits=limits)
-        overhead_len = len(overhead)
-        # The preamble is empty right now but grows as functions get named, so
-        # reserve its budget up front instead of discovering the overflow later.
-        available = limits.max_prompt_chars - overhead_len - preamble_budget
-        if available <= 0:
+        overhead_len = len(self._build_chunk_prompt([], limits=limits, preamble=False))
+        shared = limits.max_prompt_chars - overhead_len - preamble_budget
+        solo = limits.max_prompt_chars - overhead_len
+        if solo <= 0:
             raise ValueError(
                 f"max_prompt_chars={limits.max_prompt_chars} is too small: the "
-                f"prompt scaffolding alone needs "
-                f"{overhead_len + preamble_budget} chars."
+                f"prompt scaffolding alone needs {overhead_len} chars."
             )
 
-        chunks: list[list[tuple[WorkItem, str]]] = []
-        current_chunk: list[tuple[WorkItem, str]] = []
-        oversized: list[tuple[WorkItem, int]] = []
+        chunks: list[Chunk] = []
+        current: list[tuple[WorkItem, str]] = []
+        unanalyzable: list[tuple[WorkItem, str]] = []
         current_chars = 0
 
-        for item, decomp in items:
-            func = item.function
-            entry = (
-                f"### 0x{func.address:08x}: {func.name} ({func.size} bytes)\n"
-                f"```c\n{decomp}\n```\n\n"
-            )
-            entry_len = len(entry)
+        def flush() -> None:
+            nonlocal current, current_chars
+            if current:
+                chunks.append(Chunk(entries=current))
+                current = []
+                current_chars = 0
 
-            # A function that does not fit even on its own would overflow the
-            # context window. Report it instead of sending a prompt we already
-            # know is too long.
-            if entry_len > available:
-                oversized.append((item, entry_len))
+        for item, decomp in items:
+            entry_len = len(self._chunk_entry(item, decomp))
+
+            if entry_len > shared:
+                # Its own call, without the preamble reserve.
+                if entry_len <= solo:
+                    flush()
+                    chunks.append(Chunk(entries=[(item, decomp)], preamble=False))
+                    continue
+
+                cut = self._truncate_to_fit(item, decomp, solo)
+                if cut is None:
+                    unanalyzable.append(
+                        (item, self._too_large_reason(entry_len, solo, limits))
+                    )
+                    continue
+                flush()
+                chunks.append(Chunk(
+                    entries=[(item, cut)],
+                    preamble=False,
+                    truncated=frozenset({item.function.address}),
+                ))
                 continue
 
             chunk_full = (
-                current_chars + entry_len > available
-                or len(current_chunk) >= limits.max_chunk_functions
+                current_chars + entry_len > shared
+                or len(current) >= limits.max_chunk_functions
             )
-            if current_chunk and chunk_full:
-                chunks.append(current_chunk)
-                current_chunk = []
-                current_chars = 0
-            current_chunk.append((item, decomp))
+            if current and chunk_full:
+                flush()
+            current.append((item, decomp))
             current_chars += entry_len
 
-        if current_chunk:
-            chunks.append(current_chunk)
+        flush()
+        return chunks, unanalyzable
 
-        return chunks, oversized
+    def _truncate_to_fit(
+        self, item: WorkItem, decompilation: str, budget: int
+    ) -> str | None:
+        """*decompilation* cut down to fit *budget*, or None if not allowed.
+
+        A body the model never sees is a function the analysis has nothing at
+        all to say about, and on the FA18 binary the one that did not fit was
+        the program's main dispatch loop — its most connected function. Most of
+        a body names it well enough, so long as the model is told that is what
+        it is looking at, and the result says so afterwards.
+        """
+        if not self.config.analysis.truncate_oversized:
+            return None
+
+        marker_template = (
+            "\n/* --- TRUNCATED: {shown} of {total} characters shown. The rest of "
+            "this function was over the run's prompt budget. --- */"
+        )
+        marker = marker_template.format(total=len(decompilation), shown=len(decompilation))
+        room = budget - (len(self._chunk_entry(item, "")) + len(marker))
+        if room <= 0:
+            return None
+
+        kept = decompilation[:room]
+        return kept + marker_template.format(shown=len(kept), total=len(decompilation))
+
+    @staticmethod
+    def _too_large_reason(entry_len: int, solo: int, limits: ModelLimits) -> str:
+        """Why a function could not be sent, in numbers a reader can act on.
+
+        Naming the configured budget alone was misleading: the scaffolding and
+        the names preamble come out of it first, so a reader who raised the
+        budget to just over the figure in the message failed again.
+        """
+        return (
+            f"Decompilation needs {entry_len} chars and only {solo} are left for "
+            f"a function body by the {limits.max_prompt_chars} char prompt budget. "
+            f"Raise --max-prompt-chars to at least "
+            f"{limits.max_prompt_chars + entry_len - solo}, use a model with a "
+            f"larger context, or allow truncation."
+        )
 
     #: Chunk calls in flight when the provider is a hosted API. Local
     #: endpoints keep to one: they are already saturating the machine Kong
@@ -1314,7 +1402,7 @@ class Supervisor:
 
     def _recover_chunk(
         self,
-        chunk: list[tuple[WorkItem, str]],
+        chunk: Chunk,
         model: str | None,
         limits: ModelLimits,
         error: str,
@@ -1330,14 +1418,17 @@ class Supervisor:
         Returns the responses recovered, and the addresses that could not be,
         each with the error that stopped it.
         """
-        if len(chunk) == 1:
-            return [], {chunk[0][0].function.address: f"Chunk call failed: {error}"}
+        entries = chunk.entries
+        if len(entries) == 1:
+            return [], {entries[0][0].function.address: f"Chunk call failed: {error}"}
 
-        middle = len(chunk) // 2
+        middle = len(entries) // 2
         responses: list[LLMResponse] = []
         failures: dict[int, str] = {}
-        for half in (chunk[:middle], chunk[middle:]):
-            prompt = self._build_chunk_prompt(half, limits=limits)
+        for half in (entries[:middle], entries[middle:]):
+            prompt = self._build_chunk_prompt(
+                half, limits=limits, preamble=chunk.preamble,
+            )
             got, half_error = self._send_one(prompt, model, limits)
             if half_error is None:
                 responses.extend(got)
@@ -1347,7 +1438,9 @@ class Supervisor:
                 len(half), half_error,
             )
             deeper, deeper_failures = self._recover_chunk(
-                half, model, limits, half_error,
+                Chunk(entries=half, preamble=chunk.preamble,
+                      truncated=chunk.truncated),
+                model, limits, half_error,
             )
             responses.extend(deeper)
             failures.update(deeper_failures)
@@ -1355,10 +1448,12 @@ class Supervisor:
         if failures:
             logger.warning(
                 "Recovered %d of %d functions from the failed chunk.",
-                len(chunk) - len(failures), len(chunk),
+                len(entries) - len(failures), len(entries),
             )
         else:
-            logger.info("Recovered all %d functions from the failed chunk.", len(chunk))
+            logger.info(
+                "Recovered all %d functions from the failed chunk.", len(entries)
+            )
         return responses, failures
 
     def _analyze_chunks(
@@ -1376,17 +1471,12 @@ class Supervisor:
         model = model or self._primary_model
         analyzer = Analyzer(self.client, self.llm_client)
         limits = self._limits_for(model)
-        chunks, oversized = self._split_into_chunks(items, limits=limits)
+        chunks, unanalyzable = self._split_into_chunks(items, limits=limits)
         total_chunks = len(chunks)
         processed = 0
 
-        for item, entry_len in oversized:
+        for item, reason in unanalyzable:
             func = item.function
-            reason = (
-                f"Decompilation is {entry_len} chars, over the "
-                f"{limits.max_prompt_chars} char prompt budget; raise "
-                f"--max-prompt-chars or use a model with a larger context."
-            )
             logger.warning("Skipping %s: %s", func.name, reason)
             self._emit(Event(
                 type=EventType.FUNCTION_ERROR,
@@ -1442,7 +1532,12 @@ class Supervisor:
             # Prompts are built here, on the one thread that owns self.results:
             # the preamble names functions analyzed so far, and a worker
             # reading it while this loop writes to it is a race for nothing.
-            prompts = [self._build_chunk_prompt(chunk, limits=limits) for chunk in wave]
+            prompts = [
+                self._build_chunk_prompt(
+                    chunk.entries, limits=limits, preamble=chunk.preamble,
+                )
+                for chunk in wave
+            ]
             for offset_in_wave, (chunk, prompt) in enumerate(zip(wave, prompts)):
                 logger.info(
                     "Chunk %d/%d prompt: %d chars (%d functions).",
@@ -1506,6 +1601,7 @@ class Supervisor:
                             llm_calls=1,
                             signature_applied=sig_applied,
                             struct_proposals=response.struct_proposals,
+                            truncated=func.address in chunk.truncated,
                         )
                         matched += 1
                     else:
@@ -1539,8 +1635,14 @@ class Supervisor:
         self,
         items: list[tuple[WorkItem, str]],
         limits: ModelLimits | None = None,
+        preamble: bool = True,
     ) -> str:
-        """Build a prompt with all decompilations for this chunk."""
+        """Build a prompt with all decompilations for this chunk.
+
+        *preamble* carries the list of functions named so far. A call sending
+        one oversized function leaves it out: the list is a convenience, and
+        the tenth of the budget it reserves is worth more as body.
+        """
         assert self.binary_info is not None
 
         parts = [
@@ -1556,7 +1658,7 @@ class Supervisor:
         # further than the function it was invented for. It comes back once the
         # second pass has confirmed or replaced it.
         threshold = self.config.llm.refine_below
-        known = [
+        known = [] if not preamble else [
             (addr, r.name)
             for addr, r in self.results.items()
             if r.name and not r.skipped and not r.error

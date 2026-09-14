@@ -402,6 +402,24 @@ chunk is split in half and each half sent again, down to single functions, so
 what fails is the function the endpoint actually objects to and not the fifteen
 sharing its request.
 
+### A function too large for the prompt budget
+
+`--max-prompt-chars` sizes a batch call, and a function too large to share one
+is not thereby too large to analyze. It goes in a call of its own, which needs
+no room reserved for the names preamble — on a 50,000 char budget that is 5,000
+chars back, spent on body instead.
+
+A function that does not fit even then is sent with its body cut down, ending
+in a `TRUNCATED: N of M characters shown` marker so the model knows what it is
+reading. The result carries `truncated` in `analysis.json` and an `@warning`
+line in `decompiled.c`, because a name chosen from part of a function is not
+the same claim as one chosen from all of it. `--no-truncate` keeps the older
+behaviour — no analysis at all, and an entry under `failures`.
+
+This is worth having: on a 1475-function binary the single function that did
+not fit was the program's main dispatch loop, its most connected function, and
+refusing it left a hole exactly where the analysis was most wanted.
+
 ### An analysis that has no call graph
 
 An export written before Kong saved the graph has no `call_graph` in it, and
@@ -434,7 +452,7 @@ records to it.
 
 | Line in `events.log` | What happened |
 |---|---|
-| `decompilation exceeds the prompt budget` | Larger than `--max-prompt-chars`; it never reached the model. Raise the budget or use a larger context. |
+| `decompilation exceeds the prompt budget` | Only with `--no-truncate`: the body was larger than `--max-prompt-chars` leaves for one, so it never reached the model. The message names the room actually left and the figure to raise the budget to. |
 | `Chunk N/M failed: HTTP ...` | The call for a whole chunk failed, so every function in it fails at once. This is why failures arrive in bursts. |
 | `Chunk N/M: no response for 0x...` | The model answered, but not for those addresses. Common with small local models; lower `--max-chunk-functions`. |
 | `Failed to parse batch LLM response` | The reply was not valid JSON even after repair, so the chunk is lost. The line carries the start of the raw reply. |

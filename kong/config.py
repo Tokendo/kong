@@ -140,6 +140,13 @@ class AnalysisConfig:
     #: Attempts on a chunk call before its functions are split and retried
     #: individually. A chunk failure used to fail every function in it at once.
     chunk_attempts: int = 2
+    #: Send a function whose body is over the prompt budget with the body cut
+    #: down and the fact marked, instead of not analysing it at all. On the
+    #: FA18 binary the one function that did not fit was the program's main
+    #: dispatch loop, and refusing it left a hole where its most connected
+    #: function should have been. Turn it off to keep the hole rather than a
+    #: reading taken from part of a body.
+    truncate_oversized: bool = True
     #: Skip functions the signature database already identifies, instead of
     #: paying a model to name a documented library function. Off by default:
     #: the descriptions are still worth something to some readers.

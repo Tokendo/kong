@@ -57,6 +57,9 @@ def _build_function_entry(result: FunctionResult) -> dict[str, str | int | list[
         # On a two-model run this is what tells the two apart afterwards.
         "model": result.model,
         "refined": result.refined,
+        # Rare, and the one thing about a result that changes how much of it to
+        # believe: the body it was read from did not fit and was cut down.
+        "truncated": result.truncated,
     }
 
 

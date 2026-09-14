@@ -28,10 +28,12 @@ def _func(addr, name="FUN_x", size=100):
 
 
 def _chunk(addresses):
-    return [
+    from kong.agent.supervisor import Chunk
+
+    return Chunk(entries=[
         (WorkItem(function=_func(a, f"FUN_{a:08x}")), f"void f_{a:x}(void) {{}}")
         for a in addresses
-    ]
+    ])
 
 
 def _limits():
