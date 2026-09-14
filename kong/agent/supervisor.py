@@ -1918,6 +1918,30 @@ class Supervisor:
             message="Synthesis complete.",
         ))
 
+    def _transpile_selection(self) -> set[int] | None:
+        """The addresses the transpiling exporters may translate, or None for all.
+
+        A translation is a second full LLM pass over the binary, so it is
+        normally wanted for one subsystem rather than for 1500 functions of
+        runtime. The configured addresses are the ones somebody asked to read;
+        what those call comes along by default, because a function translated
+        without its callees names things that were never produced.
+        """
+        wanted = self.config.output.transpile_addresses
+        if wanted is None:
+            return None
+
+        selection = set(wanted)
+        graph = self.triage_result.call_graph if self.triage_result else None
+        if self.config.output.transpile_follow_callees and graph is not None:
+            selection = graph.closure(selection)
+
+        logger.info(
+            "Transpile selection: %d requested, %d with their callees.",
+            len(wanted), len(selection),
+        )
+        return selection
+
     def _run_export(self) -> None:
         """Generate output files."""
         self._emit(Event(
@@ -1960,9 +1984,11 @@ class Supervisor:
             duration_seconds=self.stats.duration_seconds,
             provider=self.config.llm.provider,
             phase_failures=list(self.phase_failures),
+            call_graph=self.triage_result.call_graph if self.triage_result else None,
         )
 
         formats = self.config.output.formats
+        selection = self._transpile_selection()
 
         if "source" in formats:
             path = export_source(export_data, output_dir / "decompiled.c")
@@ -1994,6 +2020,7 @@ class Supervisor:
                     self.llm_client,
                     max_prompt_chars=limits.max_prompt_chars,
                     max_output_tokens=limits.max_output_tokens,
+                    selection=selection,
                 )
             except Exception as e:
                 logger.warning("%s export failed: %s", language.display_name, e)

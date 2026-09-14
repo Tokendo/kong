@@ -75,6 +75,15 @@ class GhidraConfig:
 class OutputConfig:
     directory: Path = field(default_factory=lambda: Path("./kong_output"))
     formats: list[str] = field(default_factory=lambda: ["source", "json", "ghidra"])
+    #: Which functions the transpiling exporters translate, by address. None
+    #: means the whole binary, which is what a translation pass used to cost
+    #: whatever the reader was actually interested in: it is a second full LLM
+    #: pass, and most of a binary is runtime and helpers nobody reads.
+    transpile_addresses: set[int] | None = None
+    #: Pull in what the selected functions call, transitively. On by default
+    #: because a function translated without its callees refers to names that
+    #: were never produced. Turn it off to translate literally one function.
+    transpile_follow_callees: bool = True
 
 
 @dataclass

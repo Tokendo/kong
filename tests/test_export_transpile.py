@@ -395,3 +395,85 @@ class TestSupervisorIntegration:
         sup.run()
 
         assert not (tmp_path / "out" / "decompiled.py").exists()
+
+
+class TestSelection:
+    """A translation can cover one subsystem instead of a whole binary.
+
+    The pass is a second full LLM run over everything it is given, and most of
+    a binary is runtime and helpers nobody reads: translating all of it to get
+    at one subsystem is paying twice for nothing.
+    """
+
+    def test_no_selection_translates_everything(self):
+        data = _data(count=4)
+        llm = _ScriptedLLM([_payload(sorted(data.results))])
+
+        transpiler = Transpiler(llm, TargetLanguage.PYTHON)
+        transpiler.translate(data)
+
+        # The entry header, not a bare address: the output schema in every
+        # prompt carries an example address of its own.
+        for addr in data.results:
+            assert f"### 0x{addr:08x}:" in llm.prompts[0]
+
+    def test_only_the_selected_functions_are_sent(self):
+        data = _data(count=4)
+        kept = {0x401000, 0x401080}
+        llm = _ScriptedLLM([_payload(sorted(kept))])
+
+        transpiler = Transpiler(llm, TargetLanguage.PYTHON, selection=kept)
+        transpiler.translate(data)
+
+        prompt = "".join(llm.prompts)
+        assert "### 0x00401000:" in prompt
+        assert "### 0x00401080:" in prompt
+        assert "### 0x00401040:" not in prompt
+        assert "### 0x004010c0:" not in prompt
+
+    def test_an_unselected_function_is_absent_from_the_file(self, tmp_path):
+        data = _data(count=3)
+        kept = {0x401000}
+        translated = {
+            0x401000: TranslatedFunction(address=0x401000, code="def kept(): pass"),
+        }
+
+        out = export_translated(
+            data, tmp_path / "decompiled.py", TargetLanguage.PYTHON,
+            translated, selection=kept,
+        )
+        text = out.read_text()
+
+        assert "def kept(): pass" in text
+        assert "recovered_function_1" not in text
+
+    def test_a_scoped_file_says_it_is_partial(self, tmp_path):
+        data = _data(count=3)
+        out = export_translated(
+            data, tmp_path / "decompiled.py", TargetLanguage.PYTHON,
+            {}, selection={0x401000},
+        )
+
+        assert "Partial: 1 selected functions" in out.read_text()
+
+    def test_a_whole_binary_file_makes_no_such_claim(self, tmp_path):
+        data = _data(count=3)
+        out = export_translated(
+            data, tmp_path / "decompiled.py", TargetLanguage.PYTHON, {},
+        )
+
+        assert "Partial:" not in out.read_text()
+
+    def test_the_selection_reaches_the_file_through_transpile_and_export(self, tmp_path):
+        data = _data(count=3)
+        kept = {0x401040}
+        llm = _ScriptedLLM([_payload(sorted(kept))])
+
+        out = transpile_and_export(
+            data, tmp_path, TargetLanguage.PYTHON, llm, selection=kept,
+        )
+        text = out.read_text()
+
+        assert "### 0x00401040:" in llm.prompts[0]
+        assert "### 0x00401000:" not in llm.prompts[0]
+        assert "Partial: 1 selected functions" in text

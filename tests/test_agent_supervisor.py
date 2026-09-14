@@ -13,6 +13,7 @@ from kong.agent.coherence import REPORT_NAME
 from kong.agent.events import EventType, Phase
 from kong.agent.models import AnalysisStats, FunctionResult
 from kong.agent.supervisor import Supervisor
+from kong.agent.triage import CallGraph
 from kong.config import KongConfig, LLMConfig, LLMProvider, OutputConfig, RunStage
 from kong.ghidra.types import BinaryInfo, FunctionClassification, FunctionInfo
 
@@ -2058,3 +2059,65 @@ class TestPhaseFailuresReachTheExport:
 
         header = (tmp_path / "out" / "decompiled.c").read_text()
         assert "INCOMPLETE: synthesis failed - Request timed out." in header
+
+
+class TestTranspileSelection:
+    """Kong can translate one subsystem instead of a whole binary.
+
+    A translation is a second full LLM pass; asked for a subsystem, it used to
+    cost the other 1400 functions too.
+    """
+
+    def _supervisor(self, tmp_path, addresses=None, follow=True):
+        client = _make_client()
+        config = KongConfig(output=OutputConfig(
+            directory=tmp_path / "out",
+            transpile_addresses=addresses,
+            transpile_follow_callees=follow,
+        ))
+        sup = Supervisor(client, config)
+        sup.triage_result = MagicMock()
+        sup.triage_result.call_graph = CallGraph(callees={
+            0x1000: [0x2000],
+            0x2000: [0x3000],
+            0x3000: [],
+        })
+        return sup
+
+    def test_no_selection_means_the_whole_binary(self, tmp_path):
+        assert self._supervisor(tmp_path)._transpile_selection() is None
+
+    def test_callees_come_along_by_default(self, tmp_path):
+        sup = self._supervisor(tmp_path, addresses={0x1000})
+
+        assert sup._transpile_selection() == {0x1000, 0x2000, 0x3000}
+
+    def test_follow_can_be_turned_off(self, tmp_path):
+        sup = self._supervisor(tmp_path, addresses={0x1000}, follow=False)
+
+        assert sup._transpile_selection() == {0x1000}
+
+    def test_without_a_call_graph_the_seeds_stand_alone(self, tmp_path):
+        """An export run with no triage result to hand still honours the ask."""
+        sup = self._supervisor(tmp_path, addresses={0x1000})
+        sup.triage_result = None
+
+        assert sup._transpile_selection() == {0x1000}
+
+    def test_the_call_graph_reaches_analysis_json(self, tmp_path):
+        sup = self._supervisor(tmp_path)
+        sup.binary_info = BinaryInfo(
+            arch="x86", format="PE", endianness="little", word_size=4,
+            compiler="windows", name="FA18.exe",
+        )
+        sup.results = {
+            0x1000: FunctionResult(
+                address=0x1000, original_name="FUN_00001000", name="main",
+                confidence=90,
+            ),
+        }
+
+        sup._run_export()
+
+        document = json.loads((tmp_path / "out" / "analysis.json").read_text())
+        assert ["0x00001000", "0x00002000"] in document["call_graph"]["edges"]

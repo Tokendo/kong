@@ -247,3 +247,59 @@ class TestTriageResultCounts:
         assert counts["small"] == 2
         assert counts["large"] == 1
         assert counts["thunk"] == 1
+
+
+class TestCallGraphClosure:
+    """What a partial translation actually has to cover.
+
+    A function rendered without the functions it calls refers to names that
+    were never produced, so a selection of seeds is only the starting point.
+    """
+
+    def _graph(self):
+        return CallGraph(callees={
+            0x1000: [0x2000, 0x3000],
+            0x2000: [0x4000],
+            0x3000: [],
+            0x4000: [],
+            0x9000: [0x1000],
+        })
+
+    def test_a_seed_pulls_in_what_it_calls(self):
+        assert self._graph().closure([0x1000]) == {0x1000, 0x2000, 0x3000, 0x4000}
+
+    def test_it_follows_calls_transitively(self):
+        assert self._graph().closure([0x2000]) == {0x2000, 0x4000}
+
+    def test_it_does_not_walk_back_to_callers(self):
+        assert 0x9000 not in self._graph().closure([0x1000])
+
+    def test_a_leaf_is_its_own_closure(self):
+        assert self._graph().closure([0x4000]) == {0x4000}
+
+    def test_recursion_terminates(self):
+        graph = CallGraph(callees={0x10: [0x20], 0x20: [0x10]})
+        assert graph.closure([0x10]) == {0x10, 0x20}
+
+    def test_an_address_the_graph_never_saw_survives_as_itself(self):
+        """A skipped function is still part of the lot somebody asked for."""
+        assert self._graph().closure([0xDEAD]) == {0xDEAD}
+
+    def test_no_seeds_is_no_closure(self):
+        assert self._graph().closure([]) == set()
+
+
+class TestCallGraphEdges:
+    def test_edges_come_out_in_address_order(self):
+        graph = CallGraph(callees={0x2000: [0x5000], 0x1000: [0x3000, 0x2000]})
+
+        assert graph.edges() == [
+            (0x1000, 0x3000),
+            (0x1000, 0x2000),
+            (0x2000, 0x5000),
+        ]
+
+    def test_edge_count_matches_the_pairs(self):
+        graph = CallGraph(callees={0x1000: [0x2000, 0x3000], 0x2000: [0x3000]})
+
+        assert graph.edge_count == len(graph.edges()) == 3

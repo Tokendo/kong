@@ -7,6 +7,7 @@ builds the call graph, and produces the ordered work queue.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from kong.agent.queue import WorkQueue
@@ -26,6 +27,33 @@ class CallGraph:
     @property
     def edge_count(self) -> int:
         return sum(len(v) for v in self.callees.values())
+
+    def edges(self) -> list[tuple[int, int]]:
+        """Every call as a (caller, callee) pair, in address order."""
+        pairs: list[tuple[int, int]] = []
+        for caller in sorted(self.callees):
+            for callee in self.callees[caller]:
+                pairs.append((caller, callee))
+        return pairs
+
+    def closure(self, seeds: Iterable[int]) -> set[int]:
+        """*seeds* plus everything they call, transitively.
+
+        What a partial translation actually has to cover: a function rendered
+        without the functions it calls refers to names that were never
+        produced. Cycles are ordinary in decompiled code — recursion, mutually
+        recursive handlers, a dispatch table that reaches back — so this walks
+        with a visited set rather than recursing.
+        """
+        seen: set[int] = set()
+        stack = list(seeds)
+        while stack:
+            addr = stack.pop()
+            if addr in seen:
+                continue
+            seen.add(addr)
+            stack.extend(self.callees.get(addr, ()))
+        return seen
 
 
 @dataclass

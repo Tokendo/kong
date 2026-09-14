@@ -11,7 +11,14 @@ from click.testing import CliRunner
 
 import click
 
-from kong.__main__ import _NOT_NEEDED_STR, cli, create_llm_client, resolve_provider, validate_base_url
+from kong.__main__ import (
+    _NOT_NEEDED_STR,
+    _parse_address_selection,
+    cli,
+    create_llm_client,
+    resolve_provider,
+    validate_base_url,
+)
 from kong.config import LLMConfig, LLMProvider
 from kong.db import get_custom_config, save_setup
 
@@ -767,3 +774,74 @@ class TestStageFlag:
         result = self._invoke(tmp_path, monkeypatch, "--stage", "halfway")
 
         assert result.exit_code != 0
+
+
+class TestTranspileSelectionParsing:
+    """--transpile-only takes what a reader has to hand.
+
+    The point is that the address list a call-graph tool prints can be pasted
+    in without being reformatted first.
+    """
+
+    def test_an_inline_list(self):
+        assert _parse_address_selection("0x401000,0x401040") == {0x401000, 0x401040}
+
+    def test_bare_hex_needs_no_prefix_when_it_carries_one(self):
+        assert _parse_address_selection("0x00401000") == {0x401000}
+
+    def test_a_two_column_listing_pastes_in_unchanged(self, tmp_path):
+        listing = tmp_path / "lot.txt"
+        listing.write_text(
+            "0x0043a0d0  save_config_to_fa18_cfg\n"
+            "0x00439fc0  load_config_from_fa18_cfg\n",
+            encoding="utf-8",
+        )
+
+        assert _parse_address_selection(str(listing)) == {0x43A0D0, 0x439FC0}
+
+    def test_comments_and_blank_lines_are_skipped(self, tmp_path):
+        listing = tmp_path / "lot.txt"
+        listing.write_text("# le sous-systeme pack\n\n0x00436430\n", encoding="utf-8")
+
+        assert _parse_address_selection(str(listing)) == {0x436430}
+
+    def test_a_non_address_is_rejected_by_name(self):
+        with pytest.raises(click.BadParameter, match="not an address"):
+            _parse_address_selection("save_config_to_fa18_cfg")
+
+    def test_an_empty_file_is_rejected(self, tmp_path):
+        empty = tmp_path / "empty.txt"
+        empty.write_text("# rien\n", encoding="utf-8")
+
+        with pytest.raises(click.BadParameter, match="no addresses"):
+            _parse_address_selection(str(empty))
+
+    def test_a_comma_inside_a_comment_is_prose_not_a_separator(self, tmp_path):
+        listing = tmp_path / "lot.txt"
+        listing.write_text(
+            "# pack subsystem, exported from the call graph\n0x00436430\n",
+            encoding="utf-8",
+        )
+
+        assert _parse_address_selection(str(listing)) == {0x436430}
+
+    def test_a_trailing_comma_is_not_an_empty_address(self):
+        assert _parse_address_selection("0x401000, 0x401040,") == {0x401000, 0x401040}
+
+
+class TestTranspileSelectionGuards:
+    @patch("kong.__main__.is_setup_complete", return_value=True)
+    def test_selecting_without_asking_for_a_translation_is_an_error(
+        self, _setup, tmp_path,
+    ):
+        binary = tmp_path / "t.bin"
+        binary.write_bytes(b"MZ")
+
+        result = CliRunner().invoke(cli, [
+            "analyze", str(binary), "--transpile-only", "0x401000",
+            "--format", "source",
+        ])
+
+        assert result.exit_code == 1
+        # rich hard-wraps the console, so compare on normalised whitespace.
+        assert "no translation was asked for" in " ".join(result.output.split())

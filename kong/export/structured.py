@@ -68,6 +68,25 @@ def _build_failure_entry(result: FunctionResult) -> dict[str, str]:
     }
 
 
+def _build_call_graph_section(data: ExportData) -> dict[str, object]:
+    """Who calls whom, as triage read it from Ghidra.
+
+    Kong has always built this to order the work queue bottom-up and has never
+    written it down, so every consumer of analysis.json had to infer the edges
+    back out of the C — which only recovers calls between functions that were
+    named, and loses every call into one that was skipped. These are the edges
+    themselves, including the ones that land on a function no pass analyzed.
+    """
+    graph = data.call_graph
+    if graph is None:
+        return {"edges": []}
+    return {
+        "edges": [
+            [f"0x{caller:08x}", f"0x{callee:08x}"] for caller, callee in graph.edges()
+        ],
+    }
+
+
 def _build_phase_failure_entry(failure: PhaseFailure) -> dict[str, str]:
     entry = {"phase": failure.phase, "error": failure.error}
     if failure.detail:
@@ -100,6 +119,7 @@ def export_json(data: ExportData, output_path: Path) -> Path:
         "phase_failures": [
             _build_phase_failure_entry(f) for f in data.phase_failures
         ],
+        "call_graph": _build_call_graph_section(data),
     }
 
     output_path.write_text(json.dumps(document, indent=2))

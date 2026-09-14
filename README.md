@@ -337,19 +337,30 @@ shared or backed-up machine, prefer the environment variable.
 Written to `./kong_output_{binary_name}/` unless `--output` says otherwise:
 
 ```
-├── analysis.json         # All recovered function names, types, parameters
+├── analysis.json         # Names, types, parameters, and the call graph
 ├── decompiled.c          # Recovered C, grouped by classification
 ├── analysis_state.json   # Checkpoint, read back on the next run
 ├── coherence.json        # Contradictions found by the coherence review
 └── events.log            # Pipeline execution trace
 ```
 
+`analysis.json` carries the call graph under `call_graph.edges`, as
+`[caller, callee]` pairs of addresses. Kong reads it from Ghidra at triage to
+order the work queue bottom-up; it is written out because the edges cannot be
+recovered from `decompiled.c` afterwards — parsing the C back only finds calls
+between functions that were named, and loses every call into one that was
+skipped. It is also what `--transpile-only` walks to decide what a selected
+function drags in.
+
 ### When functions fail
 
 A run rarely names every function. `analysis.json` lists what failed under
-`failures` with a reason per address, and `events.log` holds the full trace —
-rewritten on each run, so keep a copy before re-running into the same directory.
-`kong -v analyze ...` adds DEBUG records to it.
+`failures` with a reason per address, and a phase that fell over without
+stopping the run — synthesis timing out, a translation failing — under
+`phase_failures`, so a partial result says so in the artefact rather than only
+in the log. `events.log` holds the full trace — rewritten on each run, so keep a
+copy before re-running into the same directory. `kong -v analyze ...` adds DEBUG
+records to it.
 
 | Line in `events.log` | What happened |
 |---|---|
@@ -536,9 +547,25 @@ so any function that loses behaviour is marked in place with a `NOT FAITHFUL`
 comment naming what could not be expressed, and the header counts how many
 survived intact. Nothing in the output is expected to run.
 
-It costs a second LLM pass over the whole binary — budget roughly the analysis
-again — and honours the same prompt budget, so it works against a local
-endpoint.
+It costs a second LLM pass over whatever it is given — over a whole binary,
+budget roughly the analysis again — and honours the same prompt budget, so it
+works against a local endpoint.
+
+Most of a binary is runtime and helpers nobody reads, so `--transpile-only`
+narrows the pass to the subsystem you are actually after:
+
+```bash
+kong analyze ./binary --format python --transpile-only 0x00439fc0,0x0043a0d0
+kong analyze ./binary --format python --transpile-only ./lot.txt
+```
+
+It takes an inline list or a file, and ignores anything after the address on a
+line, so a two-column `address  name` listing pastes in unchanged. What the
+selected functions call comes with them, walked through the call graph, because
+a function translated without its callees names things that were never
+produced; `--no-follow-callees` translates literally what you asked for. A
+scoped file says so in its header — what is outside the selection is absent,
+not missing.
 
 ## Benchmarks
 

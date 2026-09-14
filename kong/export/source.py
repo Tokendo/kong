@@ -10,6 +10,7 @@ from kong.llm.usage import TokenUsage
 
 if TYPE_CHECKING:
     from kong.agent.models import AnalysisStats, FunctionResult, PhaseFailure
+    from kong.agent.triage import CallGraph
 
 SECTION_ORDER: list[tuple[str, str]] = [
     ("crypto", "Crypto"),
@@ -42,6 +43,9 @@ class ExportData:
     #: Phases that failed without stopping the run. Reported in the artefacts
     #: so a partial result is legible without reading events.log.
     phase_failures: list[PhaseFailure] = field(default_factory=list)
+    #: Who calls whom, as triage read it from Ghidra. None when the export
+    #: runs without a triage result to hand.
+    call_graph: CallGraph | None = None
 
 
 def _format_header(data: ExportData) -> str:

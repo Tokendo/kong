@@ -171,6 +171,41 @@ def _warn_if_model_missing(config: LLMConfig, model: str) -> None:
         )
 
 
+def _parse_address_selection(value: str) -> set[int]:
+    """Read a set of function addresses from a file path or an inline list.
+
+    Accepts what a reader actually has to hand: a path to a file, or the
+    addresses typed straight on the command line, separated by commas,
+    whitespace or newlines. Anything after the address on a line is ignored,
+    so a two-column "address  name" listing pasted from a call-graph tool
+    works unchanged, as do `#` comments.
+    """
+    path = Path(value)
+    try:
+        text = path.read_text(encoding="utf-8") if path.is_file() else value
+    except OSError as exc:
+        raise click.BadParameter(f"cannot read {value}: {exc}") from exc
+
+    addresses: set[int] = set()
+    for raw_line in text.splitlines():
+        # Comment first: a comma inside one is prose, not a separator.
+        for field in raw_line.split("#", 1)[0].split(","):
+            # First token of the field, so "<address>  <name>" needs no editing.
+            token = field.split(maxsplit=1)[0] if field.split() else ""
+            if not token:
+                continue
+            try:
+                addresses.add(
+                    int(token, 16) if token.lower().startswith("0x") else int(token, 0)
+                )
+            except ValueError:
+                raise click.BadParameter(f"{token!r} is not an address") from None
+
+    if not addresses:
+        raise click.BadParameter(f"no addresses found in {value!r}")
+    return addresses
+
+
 def _int_or_none(value: str | None) -> int | None:
     if value is None:
         return None
@@ -409,6 +444,26 @@ def _print_final_stats(supervisor: Supervisor, llm_client: LLMClient) -> None:
         "to use the model's own figure."
     ),
 )
+@click.option(
+    "--transpile-only",
+    default=None,
+    metavar="ADDRESSES|FILE",
+    help=(
+        "Translate only these functions with --format python/csharp, instead "
+        "of the whole binary. Takes a file of addresses or an inline list; "
+        "anything after the address on a line is ignored, so a two-column "
+        "listing from a call-graph tool pastes in unchanged. What they call "
+        "comes with them unless --no-follow-callees."
+    ),
+)
+@click.option(
+    "--no-follow-callees",
+    is_flag=True,
+    help=(
+        "Translate exactly the functions named by --transpile-only. The "
+        "result will refer to functions it does not contain."
+    ),
+)
 @click.pass_context
 def analyze(
     ctx: click.Context,
@@ -428,6 +483,8 @@ def analyze(
     max_prompt_chars: int | None,
     max_chunk_functions: int | None,
     max_output_tokens: int | None,
+    transpile_only: str | None,
+    no_follow_callees: bool,
 ) -> None:
     """Analyze a binary with Kong's autonomous agent."""
     if not is_setup_complete():
@@ -443,6 +500,23 @@ def analyze(
                 "or --provider zai[/red]"
             )
             raise SystemExit(1)
+
+    transpile_addresses = (
+        _parse_address_selection(transpile_only) if transpile_only else None
+    )
+    translating = {"python", "csharp"} & {f.lower() for f in formats}
+    if transpile_addresses and not translating:
+        console.print(
+            "[red]--transpile-only selects what a translation covers, but no "
+            "translation was asked for. Add --format python or "
+            "--format csharp.[/red]"
+        )
+        raise SystemExit(1)
+    if no_follow_callees and not transpile_addresses:
+        console.print(
+            "[yellow]--no-follow-callees only means something with "
+            "--transpile-only; ignoring it.[/yellow]"
+        )
 
     run_stage = RunStage(stage.lower())
     if run_stage is RunStage.FINISH and fresh:
@@ -493,7 +567,12 @@ def analyze(
             max_chunk_functions=max_chunk_functions,
             max_output_tokens=max_output_tokens,
         ),
-        output=OutputConfig(directory=Path(output), formats=list(formats)),
+        output=OutputConfig(
+            directory=Path(output),
+            formats=list(formats),
+            transpile_addresses=transpile_addresses,
+            transpile_follow_callees=not no_follow_callees,
+        ),
         headless=headless,
         verbose=ctx.obj["verbose"],
         stage=run_stage,

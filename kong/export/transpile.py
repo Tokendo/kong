@@ -5,8 +5,10 @@ access, pointer casts and calling-convention artifacts that have no faithful
 equivalent in Python or C#, so the result is labelled a reconstruction and
 every function the model could not translate faithfully is marked in place.
 
-The translation is an extra LLM pass over the whole binary: budget for roughly
-one more analysis run.
+The translation is an extra LLM pass: over the whole binary, budget for roughly
+one more analysis run. `selection` narrows it to the functions somebody
+actually wants to read, which is the usual case — most of a binary is runtime
+and helpers, and paying to translate those is paying twice for nothing.
 """
 
 from __future__ import annotations
@@ -40,6 +42,20 @@ _OUTPUT_TOKENS_PER_FUNCTION = 600
 # The chunk header names the function count, so measuring the scaffolding with
 # an empty chunk is a couple of characters short. Round it up.
 _HEADER_SLACK = 16
+
+
+def _selected_results(
+    data: ExportData, selection: set[int] | None
+) -> list[FunctionResult]:
+    """The exportable functions, narrowed to *selection* when there is one.
+
+    Both halves of the pass go through this, so what is translated and what is
+    written out can never disagree about the scope.
+    """
+    results = _includable_results(data)
+    if selection is None:
+        return results
+    return [result for result in results if result.address in selection]
 
 
 class TargetLanguage(Enum):
@@ -84,11 +100,13 @@ class Transpiler:
         language: TargetLanguage,
         max_prompt_chars: int | None = None,
         max_output_tokens: int | None = None,
+        selection: set[int] | None = None,
     ) -> None:
         self.llm = llm
         self.language = language
         self.max_prompt_chars = max_prompt_chars
         self.max_output_tokens = max_output_tokens
+        self.selection = selection
 
     # ------------------------------------------------------------------ chunking
 
@@ -204,10 +222,16 @@ class Transpiler:
         return translated
 
     def translate(self, data: ExportData) -> dict[int, TranslatedFunction]:
-        """Translate every exportable function. Never raises on a chunk failure."""
+        """Translate the selected functions. Never raises on a chunk failure."""
+        selected = _selected_results(data, self.selection)
+        if self.selection is not None:
+            logger.info(
+                "Transpiling %d of %d functions to %s.",
+                len(selected), len(_includable_results(data)),
+                self.language.display_name,
+            )
         entries = [
-            (result, data.decompilations[result.address])
-            for result in _includable_results(data)
+            (result, data.decompilations[result.address]) for result in selected
         ]
         translated: dict[int, TranslatedFunction] = {}
 
@@ -233,23 +257,36 @@ class Transpiler:
 # ------------------------------------------------------------------- file layout
 
 
-def _python_header(data: ExportData, faithful: int, total: int) -> list[str]:
+def _python_header(
+    data: ExportData, faithful: int, total: int, scoped: bool = False
+) -> list[str]:
     bi = data.binary_info
-    return [
+    lines = [
         '"""Reconstruction of ' + bi.name + " in Python.",
         "",
         f"Source: {bi.arch} {bi.format} ({bi.compiler}), translated from Ghidra",
         "decompiler output by Kong. This is a reading aid, NOT a runnable port:",
         f"{faithful} of {total} functions translated without loss; the rest carry a",
         "NOT FAITHFUL marker naming what could not be expressed.",
-        '"""',
-        "",
-        "",
     ]
+    if scoped:
+        lines += [
+            "",
+            f"Partial: {total} selected functions, not the whole binary. Anything",
+            "outside the selection is absent, not missing.",
+        ]
+    return lines + ['"""', "", ""]
 
 
-def _csharp_header(data: ExportData, faithful: int, total: int) -> list[str]:
+def _csharp_header(
+    data: ExportData, faithful: int, total: int, scoped: bool = False
+) -> list[str]:
     bi = data.binary_info
+    scope = [
+        "//",
+        f"// Partial: {total} selected functions, not the whole binary. Anything",
+        "// outside the selection is absent, not missing.",
+    ] if scoped else []
     return [
         "// Reconstruction of " + bi.name + " in C#.",
         "//",
@@ -257,6 +294,7 @@ def _csharp_header(data: ExportData, faithful: int, total: int) -> list[str]:
         "// decompiler output by Kong. This is a reading aid, NOT a runnable port:",
         f"// {faithful} of {total} functions translated without loss; the rest carry",
         "// a NOT FAITHFUL marker naming what could not be expressed.",
+        *scope,
         "",
         "namespace Kong.Reconstructed;",
         "",
@@ -298,15 +336,16 @@ def export_translated(
     output_path: Path,
     language: TargetLanguage,
     translated: dict[int, TranslatedFunction],
+    selection: set[int] | None = None,
 ) -> Path:
     """Assemble the translated functions into one file, grouped like the C export."""
-    results = _includable_results(data)
+    results = _selected_results(data, selection)
     faithful = sum(1 for t in translated.values() if t.faithful)
 
     header = (
         _python_header if language is TargetLanguage.PYTHON else _csharp_header
     )
-    parts: list[str] = header(data, faithful, len(results))
+    parts: list[str] = header(data, faithful, len(results), selection is not None)
 
     sections: dict[str, list[FunctionResult]] = {}
     rank = {key: index for index, (key, _) in enumerate(SECTION_ORDER)}
@@ -344,15 +383,21 @@ def transpile_and_export(
     llm: LLMClient,
     max_prompt_chars: int | None = None,
     max_output_tokens: int | None = None,
+    selection: set[int] | None = None,
 ) -> Path:
-    """Run the translation pass and write the file. Returns the written path."""
+    """Run the translation pass and write the file. Returns the written path.
+
+    *selection* is the addresses to translate; None is the whole binary.
+    """
     transpiler = Transpiler(
         llm,
         language,
         max_prompt_chars=max_prompt_chars,
         max_output_tokens=max_output_tokens,
+        selection=selection,
     )
     translated = transpiler.translate(data)
     return export_translated(
-        data, output_dir / language.filename, language, translated
+        data, output_dir / language.filename, language, translated,
+        selection=selection,
     )

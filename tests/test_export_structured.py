@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from kong.agent.models import AnalysisStats, FunctionResult, PhaseFailure
+from kong.agent.triage import CallGraph
 from kong.config import LLMProvider
 from kong.export.source import ExportData
 from kong.export.structured import export_json
@@ -424,3 +425,51 @@ class TestPhaseFailures:
 
         assert [f["address"] for f in document["failures"]] == ["0x00004000"]
         assert len(document["phase_failures"]) == 1
+
+
+class TestCallGraphSection:
+    """The edges Kong reads from Ghidra now reach the document.
+
+    They were built at triage to order the work queue bottom-up and thrown
+    away afterwards, so anyone wanting the graph had to infer it back out of
+    decompiled.c — which only recovers calls between functions that were
+    named, and silently loses every call into one that was skipped.
+    """
+
+    def test_empty_without_a_triage_result(
+        self, tmp_path, binary_info, stats, token_usage, sample_results,
+    ):
+        data = _make_data(binary_info, stats, token_usage, sample_results)
+
+        document = _export_and_load(data, tmp_path)
+
+        assert document["call_graph"] == {"edges": []}
+
+    def test_edges_are_written_as_hex_pairs(
+        self, tmp_path, binary_info, stats, token_usage, sample_results,
+    ):
+        data = _make_data(binary_info, stats, token_usage, sample_results)
+        data.call_graph = CallGraph(
+            callees={0x1000: [0x2000, 0x3000], 0x2000: [0x3000]},
+        )
+
+        document = _export_and_load(data, tmp_path)
+
+        assert document["call_graph"]["edges"] == [
+            ["0x00001000", "0x00002000"],
+            ["0x00001000", "0x00003000"],
+            ["0x00002000", "0x00003000"],
+        ]
+
+    def test_it_keeps_edges_into_functions_nobody_analyzed(
+        self, tmp_path, binary_info, stats, token_usage, sample_results,
+    ):
+        """The reason to export the graph rather than parse the C back."""
+        data = _make_data(binary_info, stats, token_usage, sample_results)
+        data.call_graph = CallGraph(callees={0x1000: [0xDEAD]})
+
+        document = _export_and_load(data, tmp_path)
+
+        named = {f["address"] for f in document["functions"]}
+        assert "0x0000dead" not in named
+        assert ["0x00001000", "0x0000dead"] in document["call_graph"]["edges"]
